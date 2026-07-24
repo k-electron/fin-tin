@@ -5,7 +5,8 @@ ClickHouse access; no DDL here (Story 1.2 owns the schema, AD-18). Insert-only
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from datetime import date
 
 from fintin.core.ingest import RawFactRow
 
@@ -61,3 +62,32 @@ def read_raw_facts(client, cik: int) -> list[RawFactRow]:
         parameters={"cik": int(cik)},
     )
     return [RawFactRow(*row) for row in result.result_rows]
+
+
+def high_water_mark(client) -> date | None:
+    """The greatest ``filed_date`` in ``raw_fact`` (``None`` on an empty store).
+    A **scan-sizing hint only** (AD-16) — it bounds how far back the reconciler
+    scans, never what counts as done. Guarded by ``count()`` because ClickHouse
+    ``max()`` on an empty table returns the Date zero (1970-01-01), not NULL."""
+    rows = client.query("SELECT count(), max(filed_date) FROM raw_fact").result_rows
+    if not rows or rows[0][0] == 0:
+        return None
+    return rows[0][1]
+
+
+def present_accessions(
+    client, *, ciks: Collection[int], since: date
+) -> set[str]:
+    """The set of accessions already in ``raw_fact`` for ``ciks`` filed on/after
+    ``since`` — the AD-16 membership check over the scan window. Parameterized
+    (never string-interpolated). Empty ``ciks`` → ``set()`` with no query. No
+    ``FINAL`` needed: membership is existence, and dedup rows share an accession."""
+    cik_list = [int(c) for c in ciks]
+    if not cik_list:
+        return set()
+    result = client.query(
+        "SELECT DISTINCT accession FROM raw_fact "
+        "WHERE cik IN %(ciks)s AND filed_date >= %(since)s",
+        parameters={"ciks": cik_list, "since": since},
+    )
+    return {row[0] for row in result.result_rows}

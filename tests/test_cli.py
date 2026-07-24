@@ -175,3 +175,52 @@ def test_universe_show_ciks_prints_resolved_cik(tmp_path):
     result = runner.invoke(app, ["universe", "--config", str(p), "--show-ciks"])
     assert result.exit_code == 0
     assert "320193" in result.output
+
+
+# --- work-list (Story 2.2) -----------------------------------------------------
+# Error paths only — the happy path hits EDGAR's index (covered offline by
+# test_reconcile / test_filings_index / test_raw_fact_repo), never live in tests.
+
+_EDGAR_PLACEHOLDER = '\n[edgar]\nuser_agent_name = "fin-tin"\ncontact_email = "you@example.com"\n'
+
+
+def test_help_lists_work_list():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "work-list" in result.output
+
+
+def test_work_list_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["work-list", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_work_list_missing_universe_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)  # no [universe]
+    result = runner.invoke(app, ["work-list", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "[universe]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_work_list_missing_edgar_reports_clean_error(tmp_path):
+    # [universe] present but no [edgar] — the EdgarClient gate must fail loudly
+    # (exit 2) BEFORE any EDGAR/ClickHouse access (offline, ban-safe).
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    result = runner.invoke(app, ["work-list", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_work_list_placeholder_email_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n' + _EDGAR_PLACEHOLDER)
+    result = runner.invoke(app, ["work-list", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output

@@ -111,6 +111,9 @@ cp fintin.toml.example fintin.toml
 - **`[universe]`** — the screening Universe: a static list of `tickers` and/or
   `ciks` (the S&P 500 in v1). Tickers and CIKs are **public data** (safe to keep
   in the tracked example), unlike your contact email.
+- **`[reconcile]`** — work-list tuning. `lookback_days` (default 7) sizes the
+  reordering-safe scan window `[high-water-mark − lookback, today]` — how far
+  back to re-check EDGAR's index for stragglers and restatements.
 
 Never commit your real email — keep it only in your local `fintin.toml`. A
 missing or malformed config produces a clear error, not a stack trace.
@@ -131,6 +134,25 @@ reported as an **explained gap** (never silently dropped); resolve it by adding
 its numeric `cik` directly. The Universe is derived from config on every run
 (never stored), so **growing it is a config edit alone** — no code or schema
 change.
+
+### Preview outstanding work
+
+`fintin work-list` shows what an ingestion catch-up *would* fetch — the filings in
+EDGAR's index over the lookback window (for your Universe) that aren't yet in the
+store:
+
+```bash
+uv run fintin work-list              # summary: N outstanding filings across M companies
+uv run fintin work-list --show-items # also list each accession / cik / form / filed-date
+```
+
+It reads EDGAR's **multi-filer index** (one request per calendar quarter the
+window spans — not per-company crawling), so it **hits EDGAR and needs a real
+contact email** (like ingestion). Per-accession **membership** against the store
+is the authority (already-present filings are excluded; a newly-filed amendment
+restating an old period shows up); the high-water mark only sizes the scan
+window. It's a **read-only dry-run** — it ingests nothing (backfill/catch-up land
+in later stories).
 
 ## Testing
 
