@@ -12,7 +12,12 @@ from pathlib import Path
 import pytest
 
 from fintin.config import UniverseConfig
-from fintin.core.universe import ResolvedUniverse, UniverseGap, resolve_universe
+from fintin.core.universe import (
+    ResolvedUniverse,
+    UniverseGap,
+    normalize_ticker,
+    resolve_universe,
+)
 
 
 def _fake_resolver(mapping: dict[str, int | None]):
@@ -96,6 +101,50 @@ def test_gaps_ordered_by_config_order():
         u, resolve_tickers=_fake_resolver({"ZZ1": None, "AAPL": 320193, "ZZ2": None})
     )
     assert [g.identifier for g in resolved.gaps] == ["ZZ1", "ZZ2"]  # config order
+
+
+def test_normalized_duplicate_tickers_counted_once():
+    # ".", "-" and case variants of one ticker are the same company — count and
+    # resolve once, not thrice, and pass only the first original to the resolver.
+    u = UniverseConfig(tickers=("BRK.B", "BRK-B", "brk.b"), ciks=())
+    resolver = _fake_resolver({"BRK.B": 1067983})
+    resolved = resolve_universe(u, resolve_tickers=resolver)
+    assert resolved.ciks == (1067983,)
+    assert resolved.tickers_resolved == 1
+    assert resolver.calls == [("BRK.B",)]  # deduped to the first original
+
+
+def test_duplicate_unresolvable_ticker_gapped_once():
+    u = UniverseConfig(tickers=("ZZZZ", "ZZZZ"), ciks=())
+    resolved = resolve_universe(u, resolve_tickers=_fake_resolver({"ZZZZ": None}))
+    assert resolved.gaps == (
+        UniverseGap("ZZZZ", "not found in edgartools reference data"),
+    )
+
+
+def test_resolved_cik_out_of_range_becomes_gap():
+    # A resolved CIK must fit the UInt32 store column (matching the config guard);
+    # an out-of-range value is a gap, not a downstream insert failure.
+    u = UniverseConfig(tickers=("BADCIK",), ciks=())
+    resolved = resolve_universe(
+        u, resolve_tickers=_fake_resolver({"BADCIK": 4_294_967_296})
+    )
+    assert resolved.ciks == ()
+    assert len(resolved.gaps) == 1
+    assert "out of range" in resolved.gaps[0].reason
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("brk.b", "BRK-B"),
+        ("  aapl  ", "AAPL"),
+        ("BRK-B", "BRK-B"),
+        ("BF.B", "BF-B"),
+    ],
+)
+def test_normalize_ticker(raw, expected):
+    assert normalize_ticker(raw) == expected
 
 
 def _module_imports(path: str) -> set[str]:

@@ -42,6 +42,5 @@ tickers = [
     "JNJ", "V", "PG", "XOM", "WMT", "KO", "DIS",
 ]
 ciks = [
-    # Alphabet Class C (GOOG) by CIK, as an example of a direct entry.
-    # 1652044,
+    1652044,   # Alphabet — example of a direct CIK entry (skips ticker resolution)
 ]

@@ -20,7 +20,16 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
-from fintin.config import UniverseConfig
+from fintin.config import _CIK_MAX, UniverseConfig
+
+
+def normalize_ticker(ticker: str) -> str:
+    """Normalize a ticker to edgartools' bundled reference-table key form:
+    trimmed, upper-cased, ``.`` → ``-`` (so ``brk.b``, ``BRK.B`` and ``BRK-B``
+    all match the ``BRK-B`` key). Pure string logic (no ``edgar``) — shared by
+    the resolver adapter (which looks up this key) and by the config-order dedup
+    in :func:`resolve_universe` (so the two never disagree on identity)."""
+    return ticker.strip().upper().replace(".", "-")
 
 
 class UniverseGap(NamedTuple):
@@ -54,25 +63,42 @@ def resolve_universe(
 
     ``resolve_tickers`` is a **batch** port: given the configured ticker list it
     returns ``{ticker: cik_or_None}`` keyed by the original ticker string. A
-    ``None`` (or missing) mapping becomes a :class:`UniverseGap`; every other
-    ticker's CIK is unioned with the explicitly-listed CIKs. CIKs are returned
-    sorted and deduplicated for deterministic downstream behavior. The resolver
-    is not called when there are no tickers (a pure-CIK Universe needs no
-    resolution)."""
+    ``None`` (or missing) mapping becomes a :class:`UniverseGap`; a resolved CIK
+    outside the ``UInt32`` store range becomes a gap too (matching the config-CIK
+    guard); every other ticker's CIK is unioned with the explicitly-listed CIKs.
+    CIKs are returned sorted and deduplicated for deterministic downstream
+    behavior. Tickers are deduplicated on their **normalized** form (so a ticker
+    written twice — or as ``.``/``-`` variants — is neither double-counted nor
+    double-gapped). The resolver is not called when there are no tickers (a
+    pure-CIK Universe needs no resolution)."""
     ciks: set[int] = set(universe.ciks)
     explicit_ciks = len(ciks)
     gaps: list[UniverseGap] = []
     tickers_resolved = 0
 
-    if universe.tickers:
-        resolved = resolve_tickers(universe.tickers)
-        # Iterate the configured order (not the dict's) so gaps report in a
-        # stable, config-ordered way.
-        for ticker in universe.tickers:
+    # Dedup configured tickers on normalized form, preserving first-seen (config)
+    # order — so `["BRK.B","BRK-B","brk.b"]` or `["AAPL","AAPL"]` counts and gaps
+    # once, not thrice.
+    unique: dict[str, str] = {}  # normalized -> first original
+    for t in universe.tickers:
+        unique.setdefault(normalize_ticker(t), t)
+
+    if unique:
+        originals = list(unique.values())
+        resolved = resolve_tickers(originals)
+        for ticker in originals:  # config order → stable gap ordering
             cik = resolved.get(ticker)
             if cik is None:
                 gaps.append(
                     UniverseGap(ticker, "not found in edgartools reference data")
+                )
+                continue
+            if not (1 <= cik <= _CIK_MAX):
+                # Defense-in-depth: a resolved CIK must fit the UInt32 store
+                # column, same as a config CIK. Surface an out-of-range hit as a
+                # gap rather than letting it fail a downstream insert.
+                gaps.append(
+                    UniverseGap(ticker, f"resolved CIK {cik} out of range (UInt32)")
                 )
                 continue
             ciks.add(int(cik))

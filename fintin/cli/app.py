@@ -359,12 +359,21 @@ def universe_command(
     from fintin.adapters.edgar.universe import resolve_tickers
     from fintin.core.universe import resolve_universe
 
-    resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    # Resolution can fail on a broken edgartools install (unreadable bundled
+    # table) or an import error — render it cleanly, never as a traceback.
+    try:
+        resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    except Exception as exc:
+        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
 
+    n = len(resolved.ciks)
+    noun = "company" if n == 1 else "companies"
     typer.secho(
-        f"Universe: {len(resolved.ciks)} companies "
+        f"Universe: {n} {noun} "
         f"({resolved.explicit_ciks} from CIKs, {resolved.tickers_resolved} from tickers).",
-        fg=typer.colors.GREEN,
+        fg=typer.colors.GREEN if n else typer.colors.RED,
+        err=not n,
     )
     if resolved.gaps:
         typer.secho(
@@ -373,6 +382,16 @@ def universe_command(
         )
         for gap in resolved.gaps:
             typer.secho(f"  - {gap.identifier}: {gap.reason}", fg=typer.colors.YELLOW)
+    # An empty resolved Universe is a hard misconfiguration for a screening tool:
+    # fail loudly (exit 1) so a downstream backfill/CI trigger can't proceed over
+    # an empty scope silently. Gaps alongside a NON-empty Universe stay non-fatal.
+    if not n:
+        typer.secho(
+            "Resolved Universe is empty — check the [universe] tickers/ciks.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
     if show_ciks:
         typer.echo(" ".join(str(c) for c in resolved.ciks))
 

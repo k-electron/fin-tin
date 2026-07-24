@@ -3,7 +3,7 @@ baseline_commit: 2cd12d56485d85f22f59366de1c888ffd4f41aa0
 ---
 # Story 2.1: Resolve the Universe from config
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -112,7 +112,16 @@ edgartools 5.43.0 resolves tickers→CIK from a **bundled parquet** (`edgar/refe
 
 ## Review Findings
 
-_(to be filled by code-review)_
+Code review of story-2.1 (2026-07-24) — 3 layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor), all completed. Acceptance Auditor verdict: implementation satisfies all 3 ACs with genuine tests. Adversarial layers found real hardening gaps (verified against installed edgartools source). **7 patch, 1 defer, 0 decision-needed. Verdict: changes requested.**
+
+- [x] [Review][Patch] **Resolve directly over the bundled loader — no network fallback, exact-key match.** `get_company_cik_lookup()` → `_get_company_tickers_raw()` falls through to a live `download_json(sec.gov)` fetch when the bundled parquet fails to load (verified `tickers.py`), bypassing the rate-limited client (AD-3) + FR-1 email gate — so "guaranteed offline" is conditional. It also injects base-ticker aliases (`ticker.split('-')[0]`), so a bare `BRK`/`CRD` silently resolves to a share-class issuer instead of being a gap (Edge #3; ~25 such bare-base keys, latent nondeterminism). Fix both by building `{TICKER: int(cik)}` directly from `load_company_tickers_from_package()` (exact keys only; hard-fail with a clear error on `None` — never the network). [fintin/adapters/edgar/universe.py]
+- [x] [Review][Patch] **Wrap resolution in the `universe` command so a resolver/import failure renders cleanly, not as a traceback.** Only `load_config` is guarded; the lazy `edgar` import + `resolve_universe` call are bare, so an `ImportError`/parquet error/loader-None leaks a Python traceback — violates the house "clear error, not a stack trace" contract every sibling command honors. Wrap in `try/except Exception` → `typer.secho("Universe resolution failed: …", RED, err=True); Exit(1)`. [fintin/cli/app.py]
+- [x] [Review][Patch] **Fail loudly on an empty resolved Universe.** A config that resolves to zero CIKs (e.g. only unresolvable tickers) prints green `Universe: 0 companies` and exits 0 — a downstream backfill (Story 2.3) or CI gate keying on exit code would proceed over an empty scope silently. When `resolved.ciks` is empty → distinct warning + `Exit(1)` (gaps alongside a non-empty Universe stay non-fatal, exit 0). [fintin/cli/app.py]
+- [x] [Review][Patch] **Dedup tickers on normalized form.** Config keeps tickers verbatim and core iterates them, so `["BRK.B","BRK-B","brk.b"]` (or `["AAPL","AAPL"]`) inflates `tickers_resolved` (unreconcilable scope line) and emits duplicate gap lines. Dedup by normalized form (first-seen order) before resolving/counting. [fintin/core/universe.py]
+- [x] [Review][Patch] **Range-check ticker-resolved CIKs against UInt32.** Config CIKs are validated `1..4_294_967_295`, but a ticker-resolved CIK passes through `int(cik)` unchecked — apply the same guard so an out-of-range resolution becomes a gap, not a downstream store insert failure (latent; max bundled CIK ≈ 2.1M). [fintin/core/universe.py]
+- [x] [Review][Patch] **Pluralize "company"/"companies".** `f"{n} companies"` always pluralizes ("1 companies"); test asserts the literal. Cosmetic. [fintin/cli/app.py, tests/test_cli.py]
+- [x] [Review][Patch] **Activate an example CIK in the template.** Task 5 asked for one or two example `ciks`; all are commented out. Uncomment a real public CIK (Alphabet 1652044) as a live example. [fintin.toml.example]
+- [x] [Review][Defer] **Store keys `cik` as UInt32 (Story 1.2), but SEC CIKs are nominally up to 10 digits (> 2³²).** Currently unreachable (max assigned CIK ≈ 2.1M); pre-existing schema choice, not caused by this change. Revisit the column width if SEC assignments ever approach 2³². [fintin/adapters/store/schema.py] — deferred, pre-existing.
 
 ## Dev Agent Record
 
@@ -151,3 +160,4 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 ## Change Log
 
 - 2026-07-24 — Story 2.1 implemented: resolve the configured Universe (tickers and/or CIKs) to a deduplicated, sorted CIK set. Ticker→CIK resolution is **offline** via edgartools' bundled reference table (`get_company_cik_lookup`) — no EDGAR request, no contact email (AD-3 not triggered); the plain dict getter is used deliberately over `find_cik` to avoid its live network fallback. Pure core `resolve_universe` with an injected batch resolver port; offline edgar adapter; a `fintin universe` CLI trigger (`--show-ciks`). Unresolvable tickers → explained gaps (SM-2); the Universe is derived from config, never persisted (AD-1). 165 tests pass (+33). Status → review.
+- 2026-07-24 — Code review (3 layers, all completed). Acceptance Auditor: all 3 ACs met with genuine tests. Applied all 7 patch findings: (1) **rebuilt the resolver on `load_company_tickers_from_package()` directly** — hard-fails (`UniverseReferenceError`) on a missing bundled table instead of falling through to a live SEC fetch, and matches **exact ticker keys only** (no base-ticker aliases, so bare `BRK`/`CRD` → gap not a silent share-class hit); (2) wrapped resolution in the `universe` command (clean error, no traceback); (3) empty resolved Universe → warn + **exit 1** (was green exit 0); (4) dedup tickers on normalized form (no inflated count / duplicate gap lines); (5) range-check ticker-resolved CIKs to UInt32 → gap; (6) pluralize "1 company"; (7) activate an example CIK in the template. `normalize_ticker` moved to `core` (pure) and shared with the adapter. 1 defer (store `cik` UInt32 vs 10-digit CIK — pre-existing, logged in deferred-work.md). **175 tests pass** (+10). Status → done. Files also touched by the review: `fintin/core/universe.py`, `fintin/adapters/edgar/universe.py` (`UniverseReferenceError`), `fintin/cli/app.py`, `fintin.toml.example`, `tests/test_universe.py`, `tests/test_edgar_universe.py`, `tests/test_cli.py`.

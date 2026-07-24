@@ -151,9 +151,21 @@ def test_universe_resolves_and_reports_gap(tmp_path):
         _CH_ONLY + '\n[universe]\ntickers = ["AAPL", "ZZZZINVALID"]\n'
     )
     result = runner.invoke(app, ["universe", "--config", str(p)])
-    assert result.exit_code == 0  # gaps are recorded, not fatal
-    assert "1 companies" in result.output  # AAPL resolved
+    assert result.exit_code == 0  # a NON-empty Universe with gaps is non-fatal
+    assert "1 company " in result.output  # AAPL resolved (singular, not "1 companies")
     assert "ZZZZINVALID" in result.output  # the gap is surfaced, not silently dropped
+    assert "Traceback" not in result.output
+
+
+def test_universe_all_unresolved_exits_1(tmp_path):
+    # A Universe that resolves to zero companies is a hard misconfiguration —
+    # fail loudly so a downstream trigger can't proceed over an empty scope.
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["ZZZZINVALID"]\n')
+    result = runner.invoke(app, ["universe", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "empty" in result.output
+    assert "ZZZZINVALID" in result.output  # still lists the gap
     assert "Traceback" not in result.output
 
 
