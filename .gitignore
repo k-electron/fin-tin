@@ -11,6 +11,10 @@ dist/
 build/
 *.egg-info/
 
+# Local config — public repo: real EDGAR contact email must never be committed.
+# Copy fintin.toml.example -> fintin.toml and edit locally.
+fintin.toml
+
 # macOS
 .DS_Store
 

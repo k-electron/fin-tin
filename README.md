@@ -4,8 +4,9 @@ A locally-hosted query tool that turns SEC EDGAR financial disclosures into a
 clean, normalized, always-current-enough local corpus you can screen across
 companies with plain SQL against ClickHouse.
 
-> **Status:** early development. Story 1.1 (runnable skeleton) — a `uv`-managed
-> Python project with a Typer CLI and a local ClickHouse it connects to.
+> **Status:** early development. Runnable skeleton + ClickHouse store schema, and
+> the single compliant, rate-limited EDGAR client (identity/User-Agent, rate cap,
+> cool-down on throttle). Ingestion lands next.
 
 ## Prerequisites
 
@@ -19,10 +20,13 @@ companies with plain SQL against ClickHouse.
 # 1. Install dependencies into a local .venv
 uv sync
 
-# 2. Start ClickHouse 26.3 (single node, persistent named volume)
+# 2. Create your local config from the template (fintin.toml is gitignored)
+cp fintin.toml.example fintin.toml
+
+# 3. Start ClickHouse 26.3 (single node, persistent named volume)
 docker compose up -d
 
-# 3. Verify the app can connect
+# 4. Verify the app can connect
 uv run fintin check-connection
 ```
 
@@ -32,9 +36,27 @@ have activated `.venv`.)
 
 ## Configuration
 
-All configuration lives in a single `fintin.toml`. Story 1.1 uses only the
-`[clickhouse]` connection block; it must match the `docker-compose.yml` service.
-A missing or malformed config produces a clear error, not a stack trace.
+All configuration lives in a single `fintin.toml`. **This repo is public, so
+`fintin.toml` is gitignored** — copy the tracked template and edit your local
+copy:
+
+```bash
+cp fintin.toml.example fintin.toml
+```
+
+- **`[clickhouse]`** — connection block; already matches `docker-compose.yml`, so
+  it works out of the box.
+- **`[edgar]`** — EDGAR fair-access settings (needed once ingestion arrives).
+  EDGAR **requires** a real, identifying contact email in the User-Agent, so set
+  `contact_email` to **your real address** before running any EDGAR command. The
+  EDGAR client refuses to start on a blank/placeholder email (it would otherwise
+  send an "Undeclared Automated Tool" User-Agent and risk a ban). `rate_limit_per_sec`
+  is capped at the SEC max of 10 req/s (set lower for extra margin); on a throttle
+  breach the client honors `Retry-After` if present, else waits ≥ 10 minutes, then
+  retries.
+
+Never commit your real email — keep it only in your local `fintin.toml`. A
+missing or malformed config produces a clear error, not a stack trace.
 
 ## Testing
 
@@ -45,6 +67,10 @@ uv run pytest -m integration   # run only the container-dependent tests (needs `
 
 Integration tests connect to `localhost:8123` and are skipped automatically when
 ClickHouse is unreachable, so the default suite stays green without Docker.
+
+The EDGAR client tests **never hit live EDGAR** (a ban risk): they drive the
+cool-down logic with an injected recording sleeper and assert request headers via
+an in-process httpx `MockTransport`. No network is touched by the test suite.
 
 ## Volume persistence
 
