@@ -4,7 +4,7 @@ baseline_commit: 30ca969907e30228399b7f72ac5306cc0f6cc9dd
 
 # Story 1.1: Runnable skeleton connected to ClickHouse
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -46,7 +46,7 @@ so that I have a running foundation to build the pipeline on.
 - [x] **Task 6 — Test harness + fixtures scaffold** (AC: 1, 2, 3, 4)
   - [x] `tests/` package + `tests/fixtures/` directory (empty placeholder now; EDGAR fixtures arrive in Story 1.3+). Add `tests/conftest.py`.
   - [x] Unit tests (no container needed): `fintin --help` exits 0 and lists the connection-check command (Typer `CliRunner`); config loader accepts a valid TOML and raises `ConfigError` (not a bare exception) for missing-file and malformed-TOML cases.
-  - [x] Integration test for the live connection + volume persistence (AC-2, AC-4): mark it `@pytest.mark.integration` (or skip if the container is unreachable) so the default `uv run pytest` stays green without Docker. Document the local command to run it with the container up.
+  - [x] Integration test for the live connection (AC-2), marked `@pytest.mark.integration` and auto-skipped only when the container isn't listening, so the default `uv run pytest` stays green without Docker. **AC-4 volume persistence** is verified via a documented **manual** procedure in the README (a single pytest run cannot restart the container).
 - [x] **Task 7 — Docs** (AC: all)
   - [x] Short `README.md` quickstart: `uv sync` → `docker compose up -d` → `uv run fintin check-connection`. Note that BMad tooling scripts need Python ≥3.11, but the project itself targets ≥3.12.
 
@@ -54,14 +54,14 @@ so that I have a running foundation to build the pipeline on.
 
 _Adversarial code review (2026-07-23) — 3 parallel layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor). Triage: 0 decision-needed, 8 patch, 0 deferred, 1 dismissed. No Critical/High correctness defects; no scope-fence or architecture violations. AC-1/AC-2/AC-3 fully satisfied and tested; AC-4 mechanism correct + manually verified (see finding below)._
 
-- [ ] [Review][Patch] (medium) ClickHouse client never closed — leaked connection pool [fintin/adapters/store/client.py: get_client / check_connection]
-- [ ] [Review][Patch] (medium) Integration probe runs on every pytest run, unconditionally + no timeout — undercuts "green without Docker" (hangs on a drop-packet/half-up host) [tests/conftest.py: pytest_collection_modifyitems]
-- [ ] [Review][Patch] (medium) All connection failures reported as "Cannot reach …" — masks auth/wrong-db errors and makes integration tests silently SKIP on a misconfigured password/db [fintin/adapters/store/client.py: check_connection]
-- [ ] [Review][Patch] (medium) AC-4 persistence: Task 6 subtask is checked for an automated persistence test that does not exist (round-trip test stays within one container lifetime); README's "Volume persistence" section states data persists but gives no verification procedure [tests/test_connection.py; README.md; story Task 6]
-- [ ] [Review][Patch] (low) Config validation gaps: boolean `port` accepted (bool ⊂ int), no port range check (0/negative pass), non-string host/user/password/database silently coerced by `str()` [fintin/config.py: _parse_clickhouse]
-- [ ] [Review][Patch] (low) Round-trip test hygiene: fixed table name in the real DB, non-deterministic `>= 1` assertion, xdist race, orphaned table if killed before `finally` [tests/test_connection.py: test_read_write_round_trip]
-- [ ] [Review][Patch] (low) UTF-8 BOM in fintin.toml rejected as "Malformed TOML" (decode with utf-8-sig) [fintin/config.py: load_config]
-- [ ] [Review][Patch] (low) Structured-logging setup is dead code — `_configure_logging` + `logger` are wired but nothing ever logs [fintin/cli/app.py: _configure_logging]
+- [x] [Review][Patch] (medium) ClickHouse client never closed — leaked connection pool [fintin/adapters/store/client.py: get_client / check_connection]
+- [x] [Review][Patch] (medium) Integration probe runs on every pytest run, unconditionally + no timeout — undercuts "green without Docker" (hangs on a drop-packet/half-up host) [tests/conftest.py: pytest_collection_modifyitems]
+- [x] [Review][Patch] (medium) All connection failures reported as "Cannot reach …" — masks auth/wrong-db errors and makes integration tests silently SKIP on a misconfigured password/db [fintin/adapters/store/client.py: check_connection]
+- [x] [Review][Patch] (medium) AC-4 persistence: Task 6 subtask is checked for an automated persistence test that does not exist (round-trip test stays within one container lifetime); README's "Volume persistence" section states data persists but gives no verification procedure [tests/test_connection.py; README.md; story Task 6]
+- [x] [Review][Patch] (low) Config validation gaps: boolean `port` accepted (bool ⊂ int), no port range check (0/negative pass), non-string host/user/password/database silently coerced by `str()` [fintin/config.py: _parse_clickhouse]
+- [x] [Review][Patch] (low) Round-trip test hygiene: fixed table name in the real DB, non-deterministic `>= 1` assertion, xdist race, orphaned table if killed before `finally` [tests/test_connection.py: test_read_write_round_trip]
+- [x] [Review][Patch] (low) UTF-8 BOM in fintin.toml rejected as "Malformed TOML" (decode with utf-8-sig) [fintin/config.py: load_config]
+- [x] [Review][Patch] (low) Structured-logging setup is dead code — `_configure_logging` + `logger` are wired but nothing ever logs [fintin/cli/app.py: _configure_logging]
 
 _Dismissed (1): "unknown keys within [clickhouse] silently ignored" — over-engineering for a local v1 (no TLS in scope); later stories add config sections by design._
 
@@ -210,6 +210,7 @@ claude-opus-4-8[1m] (Claude Opus 4.8, 1M context) — bmad-dev-story workflow.
 ### Change Log
 
 - 2026-07-23 — Story 1.1 implemented: uv/Python scaffold, Typer CLI group with `check-connection`, `fintin.toml` config loader (`tomllib`) with `ConfigError`, ClickHouse `docker-compose.yml` (26.3, named volume, local password), store-adapter connection client, unit + integration test suite. All ACs verified; status → review.
+- 2026-07-23 — Code review (adversarial, 3 layers). 8 patch findings applied, 1 dismissed: client lifecycle (close on all paths); integration gating now probes only when integration tests are collected, via a timed TCP socket, and no longer masks a reachable-but-misconfigured server; config validation (reject bool/out-of-range port, non-string values); UTF-8 BOM tolerance; round-trip test hygiene (unique table, exact-value assert); structured logging now actually emits; AC-4 persistence verification documented as a manual procedure in the README (subtask wording corrected). Suite: 15 passed. Status → done.
 
 ### File List
 

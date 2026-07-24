@@ -53,7 +53,8 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
     except OSError as exc:
         raise ConfigError(f"Cannot read config file {path}: {exc}") from exc
     try:
-        data = tomllib.loads(raw.decode("utf-8"))
+        # utf-8-sig tolerates an optional BOM (common from Windows editors).
+        data = tomllib.loads(raw.decode("utf-8-sig"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
         raise ConfigError(f"Malformed TOML in {path}: {exc}") from exc
 
@@ -75,15 +76,29 @@ def _parse_clickhouse(ch: dict, path: Path) -> ClickHouseConfig:
             f"[clickhouse] in {path} is missing required key(s): "
             f"{', '.join(missing)}."
         )
+
     port = ch["port"]
-    if not isinstance(port, int):
+    # bool is a subclass of int — reject it explicitly so `port = true` is not
+    # silently accepted as port 1.
+    if isinstance(port, bool) or not isinstance(port, int):
         raise ConfigError(
             f"[clickhouse].port in {path} must be an integer, got {port!r}."
         )
+    if not (1 <= port <= 65535):
+        raise ConfigError(
+            f"[clickhouse].port in {path} must be between 1 and 65535, got {port}."
+        )
+
+    for key in ("host", "username", "password", "database"):
+        if not isinstance(ch[key], str):
+            raise ConfigError(
+                f"[clickhouse].{key} in {path} must be a string, got {ch[key]!r}."
+            )
+
     return ClickHouseConfig(
-        host=str(ch["host"]),
+        host=ch["host"],
         port=port,
-        username=str(ch["username"]),
-        password=str(ch["password"]),
-        database=str(ch["database"]),
+        username=ch["username"],
+        password=ch["password"],
+        database=ch["database"],
     )

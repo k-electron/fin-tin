@@ -7,42 +7,49 @@ schema/DDL is issued here — that is Story 1.2.
 
 from __future__ import annotations
 
+import contextlib
+
 import clickhouse_connect
 
 from fintin.config import ClickHouseConfig
 
 
 class StoreConnectionError(Exception):
-    """Raised when the store adapter cannot reach ClickHouse."""
+    """Raised when the store adapter cannot connect to (or authenticate with) ClickHouse."""
 
 
-def get_client(cfg: ClickHouseConfig):
+def get_client(cfg: ClickHouseConfig, *, connect_timeout: int | None = None):
     """Build a clickhouse-connect client from config.
 
-    Note: clickhouse-connect performs a handshake on construction, so this can
-    raise if the server is unreachable — callers that want a clean error should
-    use :func:`check_connection`.
+    Callers own the client's lifecycle — close it when done (or use
+    :func:`check_connection`, which closes its own client). clickhouse-connect
+    performs a handshake on construction, so this can raise if the server is
+    unreachable or rejects auth.
     """
-    return clickhouse_connect.get_client(
+    kwargs: dict = dict(
         host=cfg.host,
         port=cfg.port,
         username=cfg.username,
         password=cfg.password,
         database=cfg.database,
     )
+    if connect_timeout is not None:
+        kwargs["connect_timeout"] = connect_timeout
+    return clickhouse_connect.get_client(**kwargs)
 
 
-def check_connection(cfg: ClickHouseConfig) -> str:
-    """Open a client and run a trivial round-trip against ClickHouse.
+def check_connection(cfg: ClickHouseConfig, *, connect_timeout: int | None = 5) -> str:
+    """Open a client, run a trivial round-trip, and close it.
 
     Returns the server version string on success; raises
-    :class:`StoreConnectionError` on any failure (unreachable server, auth
-    failure, unexpected response).
+    :class:`StoreConnectionError` on any failure (server unreachable, auth
+    failure, wrong database, unexpected response). The client is always closed.
     """
+    client = None
     try:
-        client = get_client(cfg)
-        result = client.query("SELECT 1").result_rows
-        if not result or result[0][0] != 1:
+        client = get_client(cfg, connect_timeout=connect_timeout)
+        rows = client.query("SELECT 1").result_rows
+        if not rows or rows[0][0] != 1:
             raise StoreConnectionError(
                 f"Unexpected response from ClickHouse at {cfg.host}:{cfg.port}."
             )
@@ -52,6 +59,11 @@ def check_connection(cfg: ClickHouseConfig) -> str:
         raise
     except Exception as exc:  # clickhouse-connect raises various driver errors
         raise StoreConnectionError(
-            f"Cannot reach ClickHouse at {cfg.host}:{cfg.port} "
-            f"(database={cfg.database!r}, user={cfg.username!r}): {exc}"
+            f"Cannot connect to ClickHouse at {cfg.host}:{cfg.port} "
+            f"(database={cfg.database!r}, user={cfg.username!r}) — server unreachable, "
+            f"or wrong credentials/database: {exc}"
         ) from exc
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()

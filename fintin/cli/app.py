@@ -60,6 +60,12 @@ def check_connection_command(
         typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
+    logger.info(
+        "Checking ClickHouse connection at %s:%s (database=%s)",
+        cfg.clickhouse.host,
+        cfg.clickhouse.port,
+        cfg.clickhouse.database,
+    )
     try:
         version = check_connection(cfg.clickhouse)
     except StoreConnectionError as exc:

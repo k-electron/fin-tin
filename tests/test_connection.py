@@ -5,6 +5,8 @@ Auto-skipped when ClickHouse is unreachable (see conftest.py).
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
 
 from fintin.adapters.store.client import check_connection, get_client
@@ -20,17 +22,18 @@ def test_check_connection_live(local_clickhouse_config):
 def test_read_write_round_trip(local_clickhouse_config):
     """Verify the store adapter can create/insert/read, then clean up.
 
-    (AC-4's full stop/restart persistence check is a manual step documented in
-    the README; this confirms the read/write path works.)
+    Uses a unique table name so parallel/interrupted runs can't collide, and
+    asserts the exact value written. (AC-4's full stop/restart persistence
+    check is a manual procedure documented in the README — a single pytest run
+    cannot restart the container.)
     """
+    table = f"fintin_smoke_{uuid.uuid4().hex}"
     client = get_client(local_clickhouse_config)
-    client.command(
-        "CREATE TABLE IF NOT EXISTS fintin_smoke (x UInt8) "
-        "ENGINE = MergeTree ORDER BY x"
-    )
     try:
-        client.command("INSERT INTO fintin_smoke VALUES (1)")
-        rows = client.query("SELECT count() FROM fintin_smoke").result_rows
-        assert rows[0][0] >= 1
+        client.command(f"CREATE TABLE {table} (x UInt8) ENGINE = MergeTree ORDER BY x")
+        client.command(f"INSERT INTO {table} VALUES (42)")
+        rows = client.query(f"SELECT x FROM {table}").result_rows
+        assert rows[0][0] == 42
     finally:
-        client.command("DROP TABLE IF EXISTS fintin_smoke")
+        client.command(f"DROP TABLE IF EXISTS {table}")
+        client.close()

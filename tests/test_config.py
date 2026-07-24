@@ -65,3 +65,41 @@ def test_non_integer_port_raises(tmp_path):
     )
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_boolean_port_raises(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        '[clickhouse]\nhost = "localhost"\nport = true\n'
+        'username = "default"\npassword = ""\ndatabase = "default"\n'
+    )
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
+def test_out_of_range_port_raises(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        '[clickhouse]\nhost = "localhost"\nport = 70000\n'
+        'username = "default"\npassword = ""\ndatabase = "default"\n'
+    )
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
+def test_non_string_host_raises(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        '[clickhouse]\nhost = 123\nport = 8123\n'
+        'username = "default"\npassword = ""\ndatabase = "default"\n'
+    )
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
+def test_utf8_bom_is_tolerated(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_bytes(b"\xef\xbb\xbf" + _VALID.encode("utf-8"))
+    cfg = load_config(p)
+    assert cfg.clickhouse.host == "localhost"
+    assert cfg.clickhouse.port == 8123

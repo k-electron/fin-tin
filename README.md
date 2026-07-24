@@ -52,6 +52,29 @@ The corpus persists across container restarts via the `fintin_ch_data` named
 volume. `docker compose down` (without `-v`) then `docker compose up -d`
 preserves data; `docker compose down -v` deletes it.
 
+### Verifying persistence (manual)
+
+A single automated test can't restart the container, so verify persistence
+manually (auth uses the `default` user + the password from `fintin.toml`):
+
+```bash
+CH=http://localhost:8123/
+AUTH=(-H "X-ClickHouse-User: default" -H "X-ClickHouse-Key: fintin_local")
+
+# 1. write a row
+curl -s "$CH" "${AUTH[@]}" --data-binary \
+  "CREATE TABLE IF NOT EXISTS persist_check (x UInt8) ENGINE = MergeTree ORDER BY x"
+curl -s "$CH" "${AUTH[@]}" --data-binary "INSERT INTO persist_check VALUES (42)"
+
+# 2. restart WITHOUT deleting the volume
+docker compose down && docker compose up -d
+# (wait until http://localhost:8123/ping returns 200)
+
+# 3. confirm the row survived, then clean up
+curl -s "$CH" "${AUTH[@]}" --data-binary "SELECT x FROM persist_check"   # -> 42
+curl -s "$CH" "${AUTH[@]}" --data-binary "DROP TABLE persist_check"
+```
+
 ## Notes
 
 - The BMad tooling scripts under `_bmad/` require Python ≥ 3.11; the fin-tin
