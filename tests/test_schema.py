@@ -114,7 +114,7 @@ def test_instant_and_duration_representation(schema_client):
         f"INSERT INTO canonical_fact ({_COLS}) VALUES "
         "(320193,'0000320193-24-000001','us-gaap:Assets','Assets','Assets',"
         "'2024-09-28','2024-09-28','USD',100.0,'10-K','2024-11-01','h1','1',1),"
-        "(320193,'0000320193-24-000001','us-gaap:Revenues','Revenue','Revenues',"
+        "(320193,'0000320193-24-000001','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-10-01','2024-09-28','USD',400.0,'10-K','2024-11-01','h2','1',1)"
     )
     inst = client.query(
@@ -124,7 +124,7 @@ def test_instant_and_duration_representation(schema_client):
     assert inst[0] == inst[1]  # instant
     dur = client.query(
         "SELECT period_start, period_end FROM canonical_fact "
-        "WHERE canonical_concept = 'Revenue'"
+        "WHERE canonical_concept = 'Revenues'"
     ).result_rows[0]
     assert dur[0] < dur[1]  # duration
 
@@ -149,9 +149,9 @@ def test_latest_filed_wins_smoke(schema_client):
     store_schema.create_schema(client)
     client.command(
         f"INSERT INTO canonical_fact ({_COLS}) VALUES "
-        "(1,'0000000001-24-000001','us-gaap:Revenues','Revenue','Revenues',"
+        "(1,'0000000001-24-000001','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-01-01','2023-03-31','USD',100.0,'10-Q','2023-05-01','a','1',1),"
-        "(1,'0000000001-24-000002','us-gaap:Revenues','Revenue','Revenues',"
+        "(1,'0000000001-24-000002','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-01-01','2023-03-31','USD',150.0,'10-Q/A','2024-05-01','b','1',1)"
     )
     val = client.query(
@@ -168,7 +168,7 @@ def test_absent_concept_is_null_not_zero(schema_client):
     store_schema.create_schema(client)
     client.command(
         f"INSERT INTO canonical_fact ({_COLS}) VALUES "
-        "(7,'0000000007-24-000001','us-gaap:Revenues','Revenue','Revenues',"
+        "(7,'0000000007-24-000001','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-01-01','2023-12-31','USD',500.0,'10-K','2024-02-01','h','1',1)"
     )
     row = client.query(
@@ -187,12 +187,12 @@ def test_equal_filed_date_amendment_tiebreak(schema_client):
     store_schema.create_schema(client)
     base = (
         "INSERT INTO canonical_fact (" + _COLS + ") VALUES "
-        "(8,'0000000008-24-000001','us-gaap:Revenues','Revenue','Revenues',"
+        "(8,'0000000008-24-000001','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-01-01','2023-12-31','USD',100.0,'10-K','2024-02-01','o','1',1)"
     )
     amend = (
         "INSERT INTO canonical_fact (" + _COLS + ") VALUES "
-        "(8,'0000000008-24-000002','us-gaap:Revenues','Revenue','Revenues',"
+        "(8,'0000000008-24-000002','us-gaap:Revenues','Revenues','Revenues',"
         "'2023-01-01','2023-12-31','USD',175.0,'10-K/A','2024-02-01','a','1',1)"
     )
     client.command(base)

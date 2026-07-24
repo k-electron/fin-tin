@@ -47,16 +47,20 @@ uv run fintin schema-init
 #    contact_email in fintin.toml; rate-limited & fair-access compliant)
 uv run fintin ingest-company 320193
 
-# 3. Map Tier 0 → canonical Tier 1 via edgartools' standardization taxonomy.
-#    OFFLINE — issues zero EDGAR requests, so it needs no contact email.
+# 3. Project Tier 0 → canonical Tier 1. canonical_concept = the standard XBRL
+#    element itself (e.g. Assets, RevenueFromContractWithCustomerExcludingAssessedTax),
+#    a 1:1 lossless projection. OFFLINE — no EDGAR, so it needs no contact email.
 uv run fintin map-canonical 320193
 ```
 
-Unmappable raw tags stay in Tier 0 only (they have no cross-company canonical);
-that is expected. Re-running either command is idempotent on read (a higher
-ingest-monotonic `version` supersedes; readers use `FINAL`). After mapping, the
-`screening_mart` view exposes one row per `(cik, period)` with canonical concepts
-(`revenues`, `net_income`, `assets`, `liabilities`) as columns.
+Every standard-taxonomy fact projects 1:1 to Tier 1 (the concept is exact and
+unambiguous — the FASB element itself, not a statistical standardization). Re-running
+either command is idempotent on read (a higher ingest-monotonic `version` supersedes;
+readers use `FINAL`). The `screening_mart` view then exposes one row per `(cik, period)`
+with well-known concepts (`revenues`, `net_income`, `assets`, `liabilities`) as columns;
+each resolves to the **first present** element in a curated, ordered element list (so a
+filer using any of several synonymous elements — e.g. `SalesRevenueNet` vs
+`RevenueFromContractWithCustomerExcludingAssessedTax` — still lands under `revenues`).
 
 > **Note:** `schema-init` is create-only for tables, but the `screening_mart` view
 > is `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up mart

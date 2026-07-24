@@ -1,7 +1,7 @@
-"""Tier 0 → Tier 1 mapping tests — pure/offline. NEVER hit live EDGAR (NFR-7).
+"""Tier 0 → Tier 1 projection tests — pure/offline. NEVER hit live EDGAR (NFR-7).
 
-The transform uses an injected fake standardizer (a plain dict lookup), so these
-tests are pure and need no edgartools at all — proving the core stays edgar-free.
+The projection is pure string logic (element = raw_tag namespace stripped), so
+these tests need no edgartools at all — proving the core stays edgar-free.
 """
 
 from __future__ import annotations
@@ -12,7 +12,8 @@ from pathlib import Path
 
 from fintin.core.canonical import (
     CanonicalFactRow,
-    MapResult,
+    ProjectResult,
+    local_name,
     map_company,
     to_canonical_fact_rows,
 )
@@ -42,26 +43,32 @@ def _raw(**over) -> RawFactRow:
     return RawFactRow(**base)
 
 
-# A fake standardizer port: name-only dict lookup, None for anything else.
-def _fake_std(tag: str) -> str | None:
-    return {"us-gaap:Revenues": "Revenue", "us-gaap:Assets": "Assets"}.get(tag)
+def _project(rows, *, cik=320193, version=7):
+    return to_canonical_fact_rows(rows, cik=cik, version=version)
 
 
-def _map(rows, *, cik=320193, version=7):
-    return to_canonical_fact_rows(
-        rows, cik=cik, standardize=_fake_std, taxonomy_version=_TAXV, version=version
-    )
+# --- local_name projection ------------------------------------------------------
 
 
-def test_maps_known_concept_with_provenance():
-    rows, result = _map([_raw()])
-    assert result.mapped == 1 and result.raw_seen == 1 and result.unmapped == 0
+def test_local_name_strips_namespace():
+    assert local_name("us-gaap:Assets") == "Assets"
+    assert local_name("dei:EntityCommonStockSharesOutstanding") == "EntityCommonStockSharesOutstanding"
+    assert local_name("srt:CumulativeEffectPeriodOfAdoptionAxis") == "CumulativeEffectPeriodOfAdoptionAxis"
+    assert local_name("Assets") == "Assets"  # bare name unchanged
+
+
+# --- 1:1 lossless projection with provenance ------------------------------------
+
+
+def test_projects_element_with_provenance():
+    rows, result = _project([_raw()])
+    assert result.projected == 1 and result.raw_seen == 1
     row = rows[0]
-    assert row.canonical_concept == "Revenue"
+    assert row.canonical_concept == "Revenues"  # the standard element, verbatim
     assert row.raw_tag == "us-gaap:Revenues"
     assert row.raw_label == "Revenues"
     assert row.content_hash == "deadbeef"  # carried over from Tier 0 (AD-14)
-    assert row.taxonomy_version == _TAXV
+    assert row.taxonomy_version == _TAXV  # carried over from Tier 0 (AD-9)
     assert row.version == 7
     # identity fields preserved verbatim (AD-5)
     assert (row.accession, row.period_start, row.period_end, row.unit) == (
@@ -74,35 +81,24 @@ def test_maps_known_concept_with_provenance():
     assert not hasattr(row, "taxonomy")
 
 
-def test_unmappable_produces_no_row():
-    rows, result = _map([_raw(raw_tag="us-gaap:ZzzFake")])
-    assert rows == [] and result.unmapped == 1 and result.mapped == 0
+def test_every_fact_projects_no_drops():
+    facts = [
+        _raw(raw_tag="us-gaap:Assets"),
+        _raw(raw_tag="dei:EntityPublicFloat"),
+        _raw(raw_tag="srt:SomethingObscure"),  # still projects 1:1 — no standardization drop
+    ]
+    rows, result = _project(facts)
+    assert result.raw_seen == 3 and result.projected == 3
+    assert [r.canonical_concept for r in rows] == ["Assets", "EntityPublicFloat", "SomethingObscure"]
 
 
 def test_named_construction_not_positional():
     """A positional copy of RawFactRow (taxonomy at index 4) into CanonicalFactRow
     (canonical_concept at index 3, no taxonomy) would smuggle the raw taxonomy into
-    canonical_concept. Guard: canonical_concept is the MAPPED value, never 'us-gaap'."""
-    rows, _ = _map([_raw(taxonomy="us-gaap")])
-    assert rows[0].canonical_concept == "Revenue"
+    canonical_concept. Guard: canonical_concept is the element, never 'us-gaap'."""
+    rows, _ = _project([_raw(taxonomy="us-gaap", raw_tag="us-gaap:Revenues")])
+    assert rows[0].canonical_concept == "Revenues"
     assert rows[0].canonical_concept != "us-gaap"
-
-
-def test_two_raw_tags_same_concept_keep_two_rows():
-    # Both map to one canonical concept; distinct raw_tag → distinct identity key.
-    def std(_tag: str) -> str:
-        return "Revenue"
-
-    rows, result = to_canonical_fact_rows(
-        [_raw(raw_tag="us-gaap:Revenues"), _raw(raw_tag="us-gaap:SalesRevenueNet")],
-        cik=320193,
-        standardize=std,
-        taxonomy_version=_TAXV,
-        version=1,
-    )
-    assert result.mapped == 2
-    assert {r.raw_tag for r in rows} == {"us-gaap:Revenues", "us-gaap:SalesRevenueNet"}
-    assert {r.canonical_concept for r in rows} == {"Revenue"}
 
 
 def test_map_company_wires_ports():
@@ -110,35 +106,28 @@ def test_map_company_wires_ports():
 
     def read(cik):
         assert cik == 320193
-        return [_raw(), _raw(raw_tag="us-gaap:ZzzFake")]
+        return [_raw(), _raw(raw_tag="us-gaap:Assets")]
 
     def insert(rows):
         captured["rows"] = list(rows)
         return len(rows)
 
-    result = map_company(
-        320193,
-        read_raw_facts=read,
-        standardize=_fake_std,
-        insert_rows=insert,
-        taxonomy_version=_TAXV,
-        version=42,
-    )
-    assert isinstance(result, MapResult)
-    assert result.mapped == 1 and result.unmapped == 1 and result.raw_seen == 2
+    result = map_company(320193, read_raw_facts=read, insert_rows=insert, version=42)
+    assert isinstance(result, ProjectResult)
+    assert result.projected == 2 and result.raw_seen == 2
     assert result.version == 42
-    assert len(captured["rows"]) == 1
-    assert captured["rows"][0].version == 42  # stamped Tier 1 version
+    assert {r.canonical_concept for r in captured["rows"]} == {"Revenues", "Assets"}
+    assert all(r.version == 42 for r in captured["rows"])  # stamped Tier 1 version
 
 
 def test_empty_input_is_clean():
-    rows, result = _map([])
-    assert rows == [] and result.raw_seen == 0 and result.mapped == 0
+    rows, result = _project([])
+    assert rows == [] and result.raw_seen == 0 and result.projected == 0
 
 
 def test_core_canonical_has_no_edgar_import():
-    """AD-4/AD-9 layering: the pure core must not import `edgar` — standardization
-    is injected as a port so Tier 1 derivation stays network-free by construction."""
+    """AD-4/AD-9 layering: the pure core must not import `edgar` — the projection is
+    pure string logic, so Tier 1 derivation is network-free by construction."""
     src = Path("fintin/core/canonical.py").read_text()
     tree = ast.parse(src)
     imported: set[str] = set()

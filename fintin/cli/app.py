@@ -246,11 +246,10 @@ def map_canonical_command(
         help="Path to the fintin.toml config file.",
     ),
 ) -> None:
-    """Map a company's Tier 0 raw facts to canonical Tier 1 (offline; zero EDGAR requests)."""
+    """Project a company's Tier 0 raw facts into canonical Tier 1 (offline; zero EDGAR requests)."""
     _configure_logging()
-    # Heavy import (edgar standardization taxonomy) deferred so --help /
-    # check-connection / schema-init stay fast.
-    from fintin.adapters.edgar.standardize import standardize_concept, taxonomy_version
+    # Deferred imports keep --help / check-connection / schema-init fast. Note:
+    # the projection path imports NO `edgar` at all — "zero network" is structural.
     from fintin.adapters.store.canonical_fact_repo import (
         insert_canonical_facts,
         next_canonical_version,
@@ -277,8 +276,8 @@ def map_canonical_command(
         "Mapping CIK %s to canonical Tier 1 (database=%s)", cik, cfg.clickhouse.database
     )
 
-    # Mapping is zero-network (AC-1): it needs NO EdgarClient and NO contact email —
-    # only ClickHouse. Surface connection/auth/missing-database problems clearly.
+    # Projection is zero-network (AC-1): NO EdgarClient, NO contact email, NO edgar
+    # import — only ClickHouse. Surface connection/auth/missing-db problems clearly.
     try:
         check_connection(cfg.clickhouse)
     except StoreConnectionError as exc:
@@ -293,13 +292,11 @@ def map_canonical_command(
         result = map_company(
             cik,
             read_raw_facts=lambda c: read_raw_facts(client, c),
-            standardize=standardize_concept,
             insert_rows=lambda rows: insert_canonical_facts(client, rows),
-            taxonomy_version=taxonomy_version(),
             version=version,
         )
-    except Exception as exc:  # read/map/insert error (connection already verified)
-        typer.secho(f"Mapping failed: {exc}", fg=typer.colors.RED, err=True)
+    except Exception as exc:  # read/project/insert error (connection already verified)
+        typer.secho(f"Projection failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     finally:
         if client is not None:
@@ -315,9 +312,8 @@ def map_canonical_command(
         raise typer.Exit(code=1)
 
     typer.secho(
-        f"Mapped CIK {cik}: {result.mapped} canonical facts from {result.raw_seen} "
-        f"Tier 0 facts ({result.unmapped} tags unmappable, kept in Tier 0 only) "
-        f"into database '{cfg.clickhouse.database}'.",
+        f"Mapped CIK {cik}: {result.projected} facts projected to canonical Tier 1 "
+        f"(standard-element concepts) into database '{cfg.clickhouse.database}'.",
         fg=typer.colors.GREEN,
     )
 

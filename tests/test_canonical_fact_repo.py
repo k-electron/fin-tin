@@ -1,9 +1,9 @@
-"""Tier 1 read/write + re-map idempotency tests (require a running ClickHouse).
+"""Tier 1 read/write + re-projection idempotency tests (require a running ClickHouse).
 
 Each test runs against a unique throwaway database (Story 1.2 pattern), so the
 real `default` DB is never touched. Auto-skipped when ClickHouse isn't listening
-(see conftest.py). No live EDGAR: the standardizer used in the end-to-end seam is
-edgartools' OFFLINE bundled mapping (NFR-7).
+(see conftest.py). No EDGAR at all — the Tier 0 → Tier 1 projection is pure string
+logic (element = raw_tag namespace stripped).
 """
 
 from __future__ import annotations
@@ -14,7 +14,6 @@ from datetime import date
 
 import pytest
 
-from fintin.adapters.edgar.standardize import standardize_concept, taxonomy_version
 from fintin.adapters.store import schema as store_schema
 from fintin.adapters.store.canonical_fact_repo import (
     insert_canonical_facts,
@@ -77,7 +76,7 @@ def _canon(**over) -> CanonicalFactRow:
         cik=320193,
         accession="0000320193-24-000123",
         raw_tag="us-gaap:Revenues",
-        canonical_concept="Revenue",
+        canonical_concept="Revenues",  # the standard element, verbatim
         raw_label="Revenues",
         period_start=date(2023, 1, 1),
         period_end=date(2023, 12, 31),
@@ -109,7 +108,7 @@ def test_insert_and_read_back_canonical(schema_client):
     n = insert_canonical_facts(
         schema_client,
         [
-            _canon(raw_tag="us-gaap:Revenues", canonical_concept="Revenue", value=1000.0),
+            _canon(raw_tag="us-gaap:Revenues", canonical_concept="Revenues", value=1000.0),
             _canon(raw_tag="us-gaap:Assets", canonical_concept="Assets", value=500.0,
                    period_start=date(2023, 12, 31)),
         ],
@@ -120,10 +119,10 @@ def test_insert_and_read_back_canonical(schema_client):
         "FROM canonical_fact FINAL WHERE cik = 320193 ORDER BY raw_tag"
     ).result_rows
     assert len(rows) == 2
-    assets, revenue = rows
+    assets, revenues = rows
     assert assets[0] == "us-gaap:Assets" and assets[1] == "Assets" and assets[2] == 500.0
-    assert revenue[0] == "us-gaap:Revenues" and revenue[1] == "Revenue"
-    assert revenue[3] == "5.43.0"
+    assert revenues[0] == "us-gaap:Revenues" and revenues[1] == "Revenues"
+    assert revenues[3] == "5.43.0"
 
 
 @pytest.mark.integration
@@ -138,18 +137,18 @@ def test_next_canonical_version_is_monotonic(schema_client):
     insert_canonical_facts(schema_client, [_canon(version=5, content_hash="a")])
     assert next_canonical_version(schema_client) == 6
     insert_canonical_facts(
-        schema_client, [_canon(raw_tag="us-gaap:Assets", version=6, content_hash="b")]
+        schema_client, [_canon(raw_tag="us-gaap:Assets", canonical_concept="Assets", version=6, content_hash="b")]
     )
     assert next_canonical_version(schema_client) == 7
 
 
 @pytest.mark.integration
-def test_remap_idempotent_on_read(schema_client):
-    """AC-3: re-mapping the SAME identity with a higher version is an in-place
+def test_reproject_idempotent_on_read(schema_client):
+    """AC-3: re-projecting the SAME identity with a higher version is an in-place
     upsert on read — one row per identity key, the higher version wins, and it
     stays correct across a background merge (OPTIMIZE FINAL)."""
     insert_canonical_facts(schema_client, [_canon(value=200.0, version=1, content_hash="v1")])
-    # Re-map: same identity key, higher ingest version, corrected value.
+    # Re-project: same identity key, higher ingest version, corrected value.
     insert_canonical_facts(schema_client, [_canon(value=100.0, version=2, content_hash="v2")])
 
     def final():
@@ -165,11 +164,12 @@ def test_remap_idempotent_on_read(schema_client):
 
 
 @pytest.mark.integration
-def test_end_to_end_map_lights_up_mart(schema_client):
-    """End-to-end seam (offline): land Tier 0 facts → read_raw_facts → map with the
-    REAL edgartools standardizer → insert_canonical_facts → the resolution MV
-    auto-populates and the wide mart returns the values (proves the Task 6 label
-    reconciliation and that Revenue/Assets flow through)."""
+def test_end_to_end_project_lights_up_mart(schema_client):
+    """End-to-end seam (offline, no edgar): land Tier 0 facts → read_raw_facts →
+    project to element-keyed Tier 1 → insert_canonical_facts → the resolution MV
+    auto-populates and the wide mart's first-present concept dictionary returns the
+    values. `us-gaap:Revenues` projects to the element `Revenues`, which the
+    `revenues` column's ordered element list resolves; `us-gaap:Assets` → `Assets`."""
     insert_raw_facts(
         schema_client,
         [
@@ -184,12 +184,10 @@ def test_end_to_end_map_lights_up_mart(schema_client):
     result = map_company(
         320193,
         read_raw_facts=lambda c: read_raw_facts(schema_client, c),
-        standardize=standardize_concept,  # REAL offline edgartools mapping
         insert_rows=lambda rows: insert_canonical_facts(schema_client, rows),
-        taxonomy_version=taxonomy_version(),
         version=version,
     )
-    assert result.raw_seen == 2 and result.mapped == 2 and result.unmapped == 0
+    assert result.raw_seen == 2 and result.projected == 2
 
     revenues = schema_client.query(
         "SELECT revenues FROM screening_mart "
@@ -201,3 +199,27 @@ def test_end_to_end_map_lights_up_mart(schema_client):
         "WHERE cik = 320193 AND period_start = '2023-12-31' AND period_end = '2023-12-31'"
     ).result_rows
     assert assets and assets[0][0] == 100.0
+
+
+@pytest.mark.integration
+def test_first_present_precedence_deterministic(schema_client):
+    """The concept dictionary resolves synonymous elements by first-present
+    precedence: with BOTH RevenueFromContractWithCustomerExcludingAssessedTax (list
+    position 1) and Revenues (position 2) present for one (cik, period), the mart
+    deterministically returns the position-1 element's value — no nondeterministic
+    collision (the finding the AD-9 pivot retires)."""
+    insert_canonical_facts(
+        schema_client,
+        [
+            _canon(raw_tag="us-gaap:RevenueFromContractWithCustomerExcludingAssessedTax",
+                   canonical_concept="RevenueFromContractWithCustomerExcludingAssessedTax",
+                   value=900.0, content_hash="excl"),
+            _canon(raw_tag="us-gaap:Revenues", canonical_concept="Revenues",
+                   value=950.0, content_hash="rev"),  # includes excise tax, different value
+        ],
+    )
+    val = schema_client.query(
+        "SELECT revenues FROM screening_mart "
+        "WHERE cik = 320193 AND period_start = '2023-01-01' AND period_end = '2023-12-31'"
+    ).result_rows[0][0]
+    assert val == 900.0  # position-1 element wins deterministically
