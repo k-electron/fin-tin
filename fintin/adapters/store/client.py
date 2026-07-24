@@ -18,20 +18,26 @@ class StoreConnectionError(Exception):
     """Raised when the store adapter cannot connect to (or authenticate with) ClickHouse."""
 
 
-def get_client(cfg: ClickHouseConfig, *, connect_timeout: int | None = None):
+def get_client(
+    cfg: ClickHouseConfig,
+    *,
+    connect_timeout: int | None = None,
+    database: str | None = None,
+):
     """Build a clickhouse-connect client from config.
 
-    Callers own the client's lifecycle — close it when done (or use
-    :func:`check_connection`, which closes its own client). clickhouse-connect
-    performs a handshake on construction, so this can raise if the server is
-    unreachable or rejects auth.
+    ``database`` overrides ``cfg.database`` (used for test isolation against a
+    throwaway database). Callers own the client's lifecycle — close it when done
+    (or use :func:`check_connection`, which closes its own client).
+    clickhouse-connect performs a handshake on construction, so this can raise if
+    the server is unreachable or rejects auth.
     """
     kwargs: dict = dict(
         host=cfg.host,
         port=cfg.port,
         username=cfg.username,
         password=cfg.password,
-        database=cfg.database,
+        database=database if database is not None else cfg.database,
     )
     if connect_timeout is not None:
         kwargs["connect_timeout"] = connect_timeout
