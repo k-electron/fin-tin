@@ -56,15 +56,37 @@ uv run fintin map-canonical 320193
 Every standard-taxonomy fact projects 1:1 to Tier 1 (the concept is exact and
 unambiguous — the FASB element itself, not a statistical standardization). Re-running
 either command is idempotent on read (a higher ingest-monotonic `version` supersedes;
-readers use `FINAL`). The `screening_mart` view then exposes one row per `(cik, period)`
-with well-known concepts (`revenues`, `net_income`, `assets`, `liabilities`) as columns;
-each resolves to the **first present** element in a curated, ordered element list (so a
-filer using any of several synonymous elements — e.g. `SalesRevenueNet` vs
-`RevenueFromContractWithCustomerExcludingAssessedTax` — still lands under `revenues`).
+readers use `FINAL`).
 
-> **Note:** `schema-init` is create-only for tables, but the `screening_mart` view
-> is `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up mart
-> changes on an existing database.
+Two query surfaces expose well-known concepts (`revenues`, `net_income`, `assets`,
+`liabilities`, `stockholders_equity`, and more) as columns — screen them with plain SQL.
+Each concept resolves to the **latest-filed** value across a curated, ordered list of
+*synonymous* elements (so a filer using `SalesRevenueNet` vs
+`RevenueFromContractWithCustomerExcludingAssessedTax` still lands under `revenues`, and a
+restated period returns the newer value), tie-broken by element list-position, and only
+from authoritative periodic reports (10-K/10-Q). The concept→elements lists live in
+`fintin/adapters/store/concept_dictionary.py` — add a `ConceptDef` (name, unit,
+`duration`/`instant`, ordered elements) and re-run `schema-init` to expose a new column.
+
+- **`screening_wide`** — the main screening surface: one row per income period with the
+  balance sheet *as of that period's end* joined on, so a single screen can mix flows
+  (income) and stocks (balance sheet) and compute ratios.
+- **`screening_mart`** — the base view: one row per `(cik, period_start, period_end)`.
+  Because income facts are durations and balance-sheet facts are instants, they land in
+  *separate* rows here — use `screening_wide` when combining the two.
+
+```sql
+-- companies with annual revenue over $100B, with ROA (a flow ÷ a stock)
+SELECT cik, period_end, revenues, net_income,
+       round(net_income / assets * 100, 1) AS roa_pct
+FROM screening_wide
+WHERE revenues > 100e9 AND period_start < period_end
+ORDER BY revenues DESC;
+```
+
+> **Note:** `schema-init` is create-only for tables, but the mart/`screening_wide` views
+> are `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up view changes
+> on an existing database.
 
 ## Configuration
 
