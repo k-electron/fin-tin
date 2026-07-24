@@ -13,6 +13,7 @@ import pytest
 
 from fintin.adapters.store import schema as store_schema
 from fintin.adapters.store.client import get_client
+from fintin.adapters.store.concept_dictionary import ConceptDef
 
 _COLS = (
     "cik, accession, raw_tag, canonical_concept, raw_label, period_start, "
@@ -224,7 +225,7 @@ def test_reingest_higher_version_supersedes(schema_client):
         ).result_rows[0][0]
 
     assert resolved() == 100.0  # higher version wins pre-merge
-    client.command("OPTIMIZE TABLE resolved_fact FINAL")
+    client.command("OPTIMIZE TABLE canonical_fact FINAL")
     assert resolved() == 100.0  # ...and stays correct across a merge
 
 
@@ -232,21 +233,26 @@ def test_reingest_higher_version_supersedes(schema_client):
 
 
 def test_mart_column_empty_list_yields_null_not_syntax_error():
-    """A concept with an empty element list must NOT emit `multiIf(, NULL)` (a
-    syntax error that would break schema-init for the whole DB)."""
-    sql = store_schema._mart_column("foo", ())
+    """A concept with an empty element list must NOT emit broken SQL (which would
+    break schema-init for the whole DB) — it resolves to a NULL column."""
+    sql = store_schema._mart_column(ConceptDef("foo", "USD", ()))
     assert sql == "CAST(NULL AS Nullable(Float64)) AS foo"
-    assert "multiIf(" not in sql
 
 
 def test_mart_column_rejects_non_alphanumeric_element():
     """Element names are interpolated into DDL — a non-alphanumeric name (e.g. one
     smuggling a quote) is rejected, so a future sourced dictionary can't inject."""
     with pytest.raises(ValueError):
-        store_schema._mart_column("foo", ("Bad'; DROP TABLE x;--",))
+        store_schema._mart_column(ConceptDef("foo", "USD", ("Bad'; DROP TABLE x;--",)))
 
 
-def test_mart_column_single_element_is_valid_multiif():
-    sql = store_schema._mart_column("assets", ("Assets",))
-    assert sql.startswith("multiIf(") and sql.endswith("AS assets")
-    assert "canonical_concept = 'Assets'" in sql
+def test_mart_column_rejects_bad_unit():
+    with pytest.raises(ValueError):
+        store_schema._mart_column(ConceptDef("foo", "US'D", ("Assets",)))
+
+
+def test_mart_column_single_element_resolves_via_argmaxif():
+    sql = store_schema._mart_column(ConceptDef("assets", "USD", ("Assets",)))
+    assert sql.endswith("AS assets")
+    assert "argMaxIf(value," in sql
+    assert "canonical_concept IN ('Assets')" in sql and "unit = 'USD'" in sql

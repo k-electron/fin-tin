@@ -1,6 +1,9 @@
+---
+baseline_commit: c31dbc55fdd4f2f69ab8cbf43f4ea6d80b5313b6
+---
 # Story 1.6: Resolve latest-filed-wins and screen via the wide mart
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -38,25 +41,25 @@ The dev cannot correctly build the mart without this decision. Everything else i
 ## Tasks / Subtasks
 
 - [x] **Task 0 — Resolution-design decision** — **Approach B chosen** (derive the concept resolution on read over `canonical_fact FINAL`; no materialized concept copy, per AD-1). AD-8 updated in `ARCHITECTURE-SPINE.md`. Build Task 3 accordingly.
-- [ ] **Task 1 — Formalize the concept dictionary** (AC: 3) — `fintin/adapters/store/` (promote the Story 1.5 seed)
-  - [ ] Move `CONCEPT_DICTIONARY` to a first-class, **versioned** artifact (a `concept_dictionary.py` module or a tracked data file owned by `adapters/store`, AD-18) — each concept = an ordered tuple of standard element local names + a `dictionary_version` string.
-  - [ ] Seed each list from **observed frequency** (`SELECT canonical_concept, count(DISTINCT cik) FROM canonical_fact GROUP BY 1 ORDER BY 2 DESC`) and FASB-primary knowledge; **verify** each list (research aid, not authority — AD-9). Expand beyond the 4 seed columns to a reasonable v1 set (e.g. revenue, cost_of_revenue, gross_profit(if directly reported), operating_income, net_income, assets, current_assets, liabilities, current_liabilities, stockholders_equity, cash_and_equivalents, shares_outstanding) — keep it bounded; coverage grows by the FR-14 gap report.
-  - [ ] Element names validated `^[A-Za-z0-9]+$` before any DDL interpolation (Story 1.5 guard); empty list → NULL column.
-- [ ] **Task 2 — Latest-filed resolution correctness** (AC: 1, 2) — `fintin/adapters/store/schema.py`
-  - [ ] Ensure per-(element, unit, period) resolution is latest-filed with the AD-7 tiebreak `(filed_date, is_amendment=/A, accession, version)` — this exists in `resolved_fact_mv`; keep/verify it (Approach A extends it with `rank_state`; Approach B relies on the same rank tuple inline).
-- [ ] **Task 3 — Recency-aware wide mart** (AC: 3, 4) — `fintin/adapters/store/schema.py`
-  - [ ] Rebuild `screening_mart` per the chosen approach so each concept column = latest-filed across its element union with position tiebreak (replaces the 1.5 position-first `multiIf`). Generated from the versioned dictionary. `CREATE OR REPLACE VIEW` (re-run `schema-init` to apply).
-  - [ ] Preserve: NULL (not 0.0) when no element present; `unit='USD'` pin; one row per `(cik, period_start, period_end)`.
-- [ ] **Task 4 — Tests (never live EDGAR; NFR-7; throwaway-DB pattern)** — `tests/`
-  - [ ] **Restatement / SM-1 (REQUIRED, AC-2):** insert two filings of one period (different `filed_date`, differing values), assert the mart returns the newer value. Include the /A-amendment equal-`filed_date` tiebreak.
-  - [ ] **Recency-across-union (AC-3):** a period reported under element E2 (list pos 2) in a NEWER filing and E1 (pos 1) in an OLDER filing → mart returns E2's newer value (proves recency beats position). AND a same-filing tie (E1+E2 same `filed_date`/accession, different values) → mart deterministically returns the position-1 element (proves the tiebreak).
-  - [ ] Auto-population (AC-4), wide shape (one row per (cik,period)), NULL-not-zero, unit pin.
-  - [ ] A representative SQL screen (concept > threshold) returns the expected company-period rows (AC-5).
-  - [ ] NFR-3 tripwire (AC-6): a cross-sectional screen over a seeded multi-company set returns quickly (assert it completes; optionally log elapsed — keep it a soft check, not a flaky hard-time assert).
-- [ ] **Task 5 — Validate & document**
-  - [ ] `uv run pytest` green (unit + integration with ClickHouse up).
-  - [ ] Update `README.md`: the mart now resolves latest-filed across each concept's element union; document the concept dictionary + how to extend it.
-  - [ ] Reconcile the resolved deferred-work items (recency-aware resolution; the resolved_fact namespace-stripped-grouping discriminator per Finding 2 — address or explicitly re-defer with reason). Update `ARCHITECTURE-SPINE.md` if AD-8 changed (Task 0).
+- [x] **Task 1 — Formalize the concept dictionary** (AC: 3) — `fintin/adapters/store/` (promote the Story 1.5 seed)
+  - [x] Move `CONCEPT_DICTIONARY` to a first-class, **versioned** artifact (a `concept_dictionary.py` module or a tracked data file owned by `adapters/store`, AD-18) — each concept = an ordered tuple of standard element local names + a `dictionary_version` string.
+  - [x] Seed each list from **observed frequency** (`SELECT canonical_concept, count(DISTINCT cik) FROM canonical_fact GROUP BY 1 ORDER BY 2 DESC`) and FASB-primary knowledge; **verify** each list (research aid, not authority — AD-9). Expand beyond the 4 seed columns to a reasonable v1 set (e.g. revenue, cost_of_revenue, gross_profit(if directly reported), operating_income, net_income, assets, current_assets, liabilities, current_liabilities, stockholders_equity, cash_and_equivalents, shares_outstanding) — keep it bounded; coverage grows by the FR-14 gap report.
+  - [x] Element names validated `^[A-Za-z0-9]+$` before any DDL interpolation (Story 1.5 guard); empty list → NULL column.
+- [x] **Task 2 — Latest-filed resolution correctness** (AC: 1, 2) — `fintin/adapters/store/schema.py`
+  - [x] Ensure per-(element, unit, period) resolution is latest-filed with the AD-7 tiebreak `(filed_date, is_amendment=/A, accession, version)` — this exists in `resolved_fact_mv`; keep/verify it (Approach A extends it with `rank_state`; Approach B relies on the same rank tuple inline).
+- [x] **Task 3 — Recency-aware wide mart** (AC: 3, 4) — `fintin/adapters/store/schema.py`
+  - [x] Rebuild `screening_mart` per the chosen approach so each concept column = latest-filed across its element union with position tiebreak (replaces the 1.5 position-first `multiIf`). Generated from the versioned dictionary. `CREATE OR REPLACE VIEW` (re-run `schema-init` to apply).
+  - [x] Preserve: NULL (not 0.0) when no element present; `unit='USD'` pin; one row per `(cik, period_start, period_end)`.
+- [x] **Task 4 — Tests (never live EDGAR; NFR-7; throwaway-DB pattern)** — `tests/`
+  - [x] **Restatement / SM-1 (REQUIRED, AC-2):** insert two filings of one period (different `filed_date`, differing values), assert the mart returns the newer value. Include the /A-amendment equal-`filed_date` tiebreak.
+  - [x] **Recency-across-union (AC-3):** a period reported under element E2 (list pos 2) in a NEWER filing and E1 (pos 1) in an OLDER filing → mart returns E2's newer value (proves recency beats position). AND a same-filing tie (E1+E2 same `filed_date`/accession, different values) → mart deterministically returns the position-1 element (proves the tiebreak).
+  - [x] Auto-population (AC-4), wide shape (one row per (cik,period)), NULL-not-zero, unit pin.
+  - [x] A representative SQL screen (concept > threshold) returns the expected company-period rows (AC-5).
+  - [x] NFR-3 tripwire (AC-6): a cross-sectional screen over a seeded multi-company set returns quickly (assert it completes; optionally log elapsed — keep it a soft check, not a flaky hard-time assert).
+- [x] **Task 5 — Validate & document**
+  - [x] `uv run pytest` green (unit + integration with ClickHouse up).
+  - [x] Update `README.md`: the mart now resolves latest-filed across each concept's element union; document the concept dictionary + how to extend it.
+  - [x] Reconcile the resolved deferred-work items (recency-aware resolution; the resolved_fact namespace-stripped-grouping discriminator per Finding 2 — address or explicitly re-defer with reason). Update `ARCHITECTURE-SPINE.md` if AD-8 changed (Task 0).
 
 ## Dev Notes
 
@@ -101,8 +104,33 @@ The dev cannot correctly build the mart without this decision. Everything else i
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Opus 4.8, 1M context)
+
 ### Debug Log References
+
+- Full suite green: `uv run pytest -q` → **128 passed** (0 skipped; ClickHouse up so integration ran).
+- Live-verified on the real `default` DB (Apple): after `schema-init` refreshed the mart view, `screening_mart` returns FY2025 revenue $416.16B, COGS $220.96B, gross profit $195.20B, net income $112.01B; FY2024 revenue $391.04B / NI $93.74B; balance sheet 2026-03-28 assets $371.08B, current_assets $144.11B, liabilities $264.59B, equity $106.49B, shares 14,667,688,000. Accounting identities hold (rev − COGS = gross profit; assets = liabilities + equity). Apple's three revenue elements (`SalesRevenueNet`/`RevenueFromContractWithCustomerExcludingAssessedTax`/`Revenues`) unify under `revenues`.
 
 ### Completion Notes List
 
+- **Approach B** (Task 0): the wide `screening_mart` is a VIEW over `canonical_fact FINAL`; each concept column = `if(countIf(cond)>0, argMaxIf(value, (filed_date, /A, accession, version, element_position), cond), NULL)` where `cond = canonical_concept IN (elements) AND unit=<pinned>`. Derived on read — no materialized concept copy, can't drift (AD-1).
+- **AC-1/AC-2 (SM-1):** latest-filed wins per (element, unit, period) with the AD-7 `/A`-then-greatest-accession tiebreak; the required restatement test (`test_restatement_newer_filing_wins`) proves the newer filing supersedes.
+- **AC-3:** recency across the element union with element-position as the deterministic tiebreak — `test_recency_beats_position_across_elements` (newer lower-precedence element beats older higher-precedence) + `test_same_filing_position_tiebreak_deterministic` (position wins a same-filing tie, stable across `OPTIMIZE FINAL`).
+- **Concept dictionary** promoted to a versioned artifact `fintin/adapters/store/concept_dictionary.py` (`ConceptDef(alias, unit, elements)`, `DICTIONARY_VERSION`), expanded from 4 → 12 headline concepts, element names verified against live usage. `unit` pinned per concept (incl. `shares` for `shares_outstanding`). DDL-injection guarded (element + unit regex; empty-list → NULL column).
+- **`resolved_fact`/`resolved_fact_mv` retained** unchanged (element-grained, ad-hoc); the mart no longer reads them (AD-8 revised to match).
+- **AC-5/AC-6:** SQL screen returns matching company-period rows; a 50-company cross-sectional screen returns correctly (soft NFR-3 tripwire; ClickHouse handles derive-on-read comfortably at scale).
+- Deferred-work reconciled: the recency-aware-resolution item is RESOLVED here; the cross-namespace same-local-name collision remains latent (v1 dictionary has no twin) with a one-line Approach-B fix noted.
+
 ### File List
+
+- `fintin/adapters/store/concept_dictionary.py` (NEW) — versioned concept dictionary (`ConceptDef`, `DICTIONARY_VERSION`, `CONCEPT_DICTIONARY`).
+- `fintin/adapters/store/schema.py` (MOD) — `screening_mart` rebuilt as Approach B over `canonical_fact FINAL` (`_mart_column`/`_build_screening_mart` generate `argMaxIf` + position tiebreak + NULL guard from the dictionary); `resolved_fact`/MV retained; docstring + AD-8 notes updated.
+- `tests/test_screening_mart.py` (NEW) — restatement/SM-1, recency-vs-position, same-filing tiebreak, NULL-not-zero, shares unit, wide shape, SQL screen, NFR-3 tripwire.
+- `tests/test_schema.py` (MOD) — `_mart_column` unit tests updated to `ConceptDef` + Approach-B output; merge-stability test `OPTIMIZE`s `canonical_fact`.
+- `README.md` (MOD) — mart resolves latest-filed across each concept's element union; how to extend the concept dictionary + an example screen.
+- `_bmad-output/implementation-artifacts/deferred-work.md` (MOD) — reconciled the re-review deferrals.
+- Planning (prior commit c31dbc5): `ARCHITECTURE-SPINE.md` AD-8 revision + this story's decision.
+
+## Change Log
+
+- 2026-07-24 — Story 1.6 implemented (Approach B): wide screening mart resolves latest-filed across each concept's element union (element-position tiebreak), derived on read over `canonical_fact FINAL`; concept dictionary formalized as a versioned artifact (12 concepts). Required restatement/SM-1 test + recency/tiebreak tests added. 128 tests pass; verified live on Apple (accounting identities hold). Status → review.

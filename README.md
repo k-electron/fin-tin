@@ -56,11 +56,25 @@ uv run fintin map-canonical 320193
 Every standard-taxonomy fact projects 1:1 to Tier 1 (the concept is exact and
 unambiguous — the FASB element itself, not a statistical standardization). Re-running
 either command is idempotent on read (a higher ingest-monotonic `version` supersedes;
-readers use `FINAL`). The `screening_mart` view then exposes one row per `(cik, period)`
-with well-known concepts (`revenues`, `net_income`, `assets`, `liabilities`) as columns;
-each resolves to the **first present** element in a curated, ordered element list (so a
-filer using any of several synonymous elements — e.g. `SalesRevenueNet` vs
-`RevenueFromContractWithCustomerExcludingAssessedTax` — still lands under `revenues`).
+readers use `FINAL`).
+
+The `screening_mart` view is the query surface: one row per `(cik, period)` with
+well-known concepts (`revenues`, `net_income`, `assets`, `liabilities`, and more) as
+columns — screen it with plain SQL. Each column resolves to the **latest-filed** value
+across a curated, ordered list of synonymous elements (so a filer using `SalesRevenueNet`
+vs `RevenueFromContractWithCustomerExcludingAssessedTax` still lands under `revenues`, and
+a restated period returns the newer value), tie-broken by element list-position. The
+concept→elements lists live in `fintin/adapters/store/concept_dictionary.py` — add a
+`ConceptDef` (concept name, unit, ordered element list) and re-run `schema-init` to expose
+a new screening column.
+
+```sql
+-- example screen: companies with annual revenue over $100B
+SELECT cik, period_end, revenues, net_income
+FROM screening_mart
+WHERE revenues > 100e9 AND period_start < period_end
+ORDER BY revenues DESC;
+```
 
 > **Note:** `schema-init` is create-only for tables, but the `screening_mart` view
 > is `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up mart
