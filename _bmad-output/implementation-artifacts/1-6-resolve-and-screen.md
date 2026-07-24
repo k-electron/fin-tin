@@ -3,7 +3,7 @@ baseline_commit: c31dbc55fdd4f2f69ab8cbf43f4ea6d80b5313b6
 ---
 # Story 1.6: Resolve latest-filed-wins and screen via the wide mart
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -100,6 +100,20 @@ The dev cannot correctly build the mart without this decision. Everything else i
 - [Source: _bmad-output/implementation-artifacts/deferred-work.md#re-review-of-story-1.5 — recency-aware resolution; namespace discriminator]
 - [Source: _bmad-output/implementation-artifacts/1-5-map-canonical-tier1.md — element-keyed Tier 1]
 
+## Review Findings
+
+Code review of story-1.6 (2026-07-24) — 3 layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor), all completed. Core ACs verified (restatement/SM-1, recency-across-union + same-filing position tiebreak, SQL screen, NULL-not-0.0, unit pin, NFR-7). **1 decision-needed, 5 patch, 4 defer. Verdict: changes requested.**
+
+- [x] [Review][Decision] **Flow vs stock concepts never share a mart row.** The mart groups by `(cik, period_start, period_end)`; income concepts are durations (`start < end`), balance-sheet concepts are instants (`start == end`), so a cross-statement screen (`revenues > X AND assets > Y`) or any ratio (ROA, leverage, per-share) returns **empty**. Confirmed live on Apple (FY2025 revenue row `2024-09-29..2025-09-27` vs assets row `2025-09-27..2025-09-27`). Both Blind (HIGH) + Edge (MED) flagged; the README oversells "one row per (cik, period)". Decide: **(A)** add a period-collapsed companion view that LEFT JOINs each income (duration) row to the company's balance-sheet instant at `period_end` (so cross-statement screens/ratios work), or **(B)** document the split + provide the join pattern and defer the companion view. [fintin/adapters/store/schema.py screening_mart] — **RESOLVED: Approach A.** Added the `screening_wide` view (one row per income period with the balance sheet as-of `period_end` joined on); `ConceptDef.period_type` partitions flow/stock. Verified live on Apple: ROA 31.2%, debt/equity 3.87 compute in a single row.
+- [x] [Review][Patch] Tighten non-synonymous concept unions for exactness — `revenues` drop `…IncludingAssessedTax`; `net_income` keep `NetIncomeLoss` only (drop `ProfitLoss`, incl-NCI); `stockholders_equity` keep `StockholdersEquity` (drop incl-NCI total); `cash_and_equivalents` keep `CashAndCashEquivalentsAtCarryingValue` (drop restricted-inclusive). Annotate each concept's precise definition; bump `DICTIONARY_VERSION`. [fintin/adapters/store/concept_dictionary.py]
+- [x] [Review][Patch] Restrict the mart to authoritative periodic forms (`AND (startsWith(form,'10-K') OR startsWith(form,'10-Q'))`) so a later-filed 8-K can't override the 10-K/10-Q; add a test that an 8-K fact is excluded. [fintin/adapters/store/schema.py _mart_column]
+- [x] [Review][Patch] Validate `alias` (`^[A-Za-z_][A-Za-z0-9_]*$`) + reject duplicate aliases in the mart builder — the injection guard covers element/unit but not the column alias. [fintin/adapters/store/schema.py]
+- [x] [Review][Patch] Append `raw_tag` as the final rank term to retire the latent cross-namespace same-local-name nondeterminism (trivial). [fintin/adapters/store/schema.py _mart_column]
+- [x] [Review][Patch] Add a test isolating the greatest-accession tiebreak (equal `filed_date`, both non-`/A`, differing accession). [tests/test_screening_mart.py]
+- [x] [Review][Defer] Drop redundant `FROM canonical_fact FINAL` (version is already in the `argMaxIf` rank → correctness-neutral; a market-scale perf win) — deferred as a validated NFR-3 optimization. [schema.py]
+- [x] [Review][Defer] Drop now-unused `resolved_fact`/`resolved_fact_mv` under Approach B (write-path overhead nothing reads) — deferred keep/drop; recommend drop for AD-1 consistency. [schema.py]
+- [x] [Review][Defer] Observability/coverage: wire/surface `DICTIONARY_VERSION`; NFR-3 tripwire measures no timing; `resolved_fact` lacks direct coverage — low/informational.
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -134,3 +148,4 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 ## Change Log
 
 - 2026-07-24 — Story 1.6 implemented (Approach B): wide screening mart resolves latest-filed across each concept's element union (element-position tiebreak), derived on read over `canonical_fact FINAL`; concept dictionary formalized as a versioned artifact (12 concepts). Required restatement/SM-1 test + recency/tiebreak tests added. 128 tests pass; verified live on Apple (accounting identities hold). Status → review.
+- 2026-07-24 — Code review (3 layers, all completed). Applied **Approach A** (new `screening_wide` companion view joining each income period to the balance sheet as-of `period_end`, via `ConceptDef.period_type`) + 5 patches: tightened the concept dictionary to true synonyms (dropped incl-NCI / restricted-cash / incl-assessed-tax / `ProfitLoss` variants; `DICTIONARY_VERSION`→2), restricted the mart to periodic forms (10-K/10-Q) so an 8-K can't override, validated `alias` + duplicate-alias check, appended `raw_tag` to the resolution rank, added the greatest-accession-tiebreak test. Deferred (low): drop redundant `FINAL`, drop unused `resolved_fact`/MV, observability. **132 tests pass**; `screening_wide` verified live on Apple (ROA 31.2%, debt/equity 3.87 in one row). Status → done. Files also touched: `fintin/adapters/store/concept_dictionary.py` (period_type + tightened lists), `fintin/adapters/store/schema.py` (`screening_wide` + periodic filter + alias/raw_tag guards), `tests/test_screening_mart.py` (+3 tests), `tests/test_schema.py` (+alias test).

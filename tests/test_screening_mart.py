@@ -236,3 +236,70 @@ def test_cross_sectional_screen_returns(schema_client):
         "WHERE period_start = '2023-01-01' AND period_end = '2023-12-31' AND revenues > 100"
     ).result_rows[0][0]
     assert hits == 40  # ciks 11..50 have revenues > 100
+
+
+# --- form primacy + accession tiebreak (review patches) --------------------------
+
+
+@pytest.mark.integration
+def test_non_periodic_form_excluded(schema_client):
+    """A later-filed 8-K must NOT override the audited 10-K/10-Q — the mart restricts
+    to periodic forms, so recency can't pull in a non-authoritative value."""
+    insert_canonical_facts(
+        schema_client,
+        [
+            _fact(accession="0000000100-24-000001", value=500.0, filed_date=date(2024, 2, 1),
+                  form="10-K", content_hash="k"),
+            _fact(accession="0000000100-24-000009", value=999.0, filed_date=date(2024, 6, 1),
+                  form="8-K", content_hash="e"),  # newer, but non-periodic
+        ],
+    )
+    assert _revenues(schema_client) == 500.0  # 8-K excluded despite being newer
+
+
+@pytest.mark.integration
+def test_greatest_accession_tiebreak(schema_client):
+    """AC-1: on an equal filed_date with neither row a /A, the greatest accession
+    wins (isolates the accession tiebreak — both non-/A, same date)."""
+    insert_canonical_facts(
+        schema_client,
+        [
+            _fact(accession="0000000100-24-000001", value=100.0, filed_date=date(2024, 2, 1),
+                  form="10-K", content_hash="a"),
+            _fact(accession="0000000100-24-000002", value=200.0, filed_date=date(2024, 2, 1),
+                  form="10-K", content_hash="b"),
+        ],
+    )
+    assert _revenues(schema_client) == 200.0  # greater accession wins
+
+
+# --- screening_wide: cross-statement (flow + stock) in one row -------------------
+
+
+@pytest.mark.integration
+def test_screening_wide_joins_flow_and_stock(schema_client):
+    """The base mart keeps income (duration) and balance-sheet (instant) facts in
+    separate rows; screening_wide joins the balance sheet AS OF period_end onto the
+    income row, so a single screen can mix flows and stocks (ROA, leverage, ...)."""
+    insert_canonical_facts(
+        schema_client,
+        [
+            _fact(canonical_concept="Revenues", raw_tag="us-gaap:Revenues", value=1000.0,
+                  period_start=date(2023, 1, 1), period_end=date(2023, 12, 31), content_hash="rev"),
+            _fact(canonical_concept="NetIncomeLoss", raw_tag="us-gaap:NetIncomeLoss", value=120.0,
+                  period_start=date(2023, 1, 1), period_end=date(2023, 12, 31), content_hash="ni"),
+            _fact(canonical_concept="Assets", raw_tag="us-gaap:Assets", value=5000.0,
+                  period_start=date(2023, 12, 31), period_end=date(2023, 12, 31), content_hash="as"),  # instant
+        ],
+    )
+    row = schema_client.query(
+        "SELECT revenues, net_income, assets FROM screening_wide "
+        "WHERE cik = 100 AND period_start = '2023-01-01' AND period_end = '2023-12-31'"
+    ).result_rows
+    assert len(row) == 1
+    assert row[0] == (1000.0, 120.0, 5000.0)  # flow + stock in ONE row
+    # ...and a cross-statement screen (mixing a flow and a stock) returns it.
+    hits = schema_client.query(
+        "SELECT cik FROM screening_wide WHERE revenues > 500 AND assets > 1000"
+    ).result_rows
+    assert [r[0] for r in hits] == [100]

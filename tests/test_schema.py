@@ -102,7 +102,7 @@ def test_schema_init_is_idempotent(schema_client):
     after = client.query(
         f"SELECT count() FROM system.tables WHERE database = '{db}'"
     ).result_rows[0][0]
-    assert before == after == 5  # 4 tables + 1 view; MV uses TO (no inner table)
+    assert before == after == 6  # 4 tables + 2 views (screening_mart, screening_wide); MV uses TO
 
 
 @pytest.mark.integration
@@ -235,7 +235,7 @@ def test_reingest_higher_version_supersedes(schema_client):
 def test_mart_column_empty_list_yields_null_not_syntax_error():
     """A concept with an empty element list must NOT emit broken SQL (which would
     break schema-init for the whole DB) — it resolves to a NULL column."""
-    sql = store_schema._mart_column(ConceptDef("foo", "USD", ()))
+    sql = store_schema._mart_column(ConceptDef("foo", "USD", "duration", ()))
     assert sql == "CAST(NULL AS Nullable(Float64)) AS foo"
 
 
@@ -243,16 +243,23 @@ def test_mart_column_rejects_non_alphanumeric_element():
     """Element names are interpolated into DDL — a non-alphanumeric name (e.g. one
     smuggling a quote) is rejected, so a future sourced dictionary can't inject."""
     with pytest.raises(ValueError):
-        store_schema._mart_column(ConceptDef("foo", "USD", ("Bad'; DROP TABLE x;--",)))
+        store_schema._mart_column(ConceptDef("foo", "USD", "duration", ("Bad'; DROP TABLE x;--",)))
 
 
 def test_mart_column_rejects_bad_unit():
     with pytest.raises(ValueError):
-        store_schema._mart_column(ConceptDef("foo", "US'D", ("Assets",)))
+        store_schema._mart_column(ConceptDef("foo", "US'D", "duration", ("Assets",)))
+
+
+def test_mart_column_rejects_bad_alias():
+    """The column alias is interpolated into DDL too — must be a SQL identifier."""
+    with pytest.raises(ValueError):
+        store_schema._mart_column(ConceptDef("bad alias; --", "USD", "instant", ("Assets",)))
 
 
 def test_mart_column_single_element_resolves_via_argmaxif():
-    sql = store_schema._mart_column(ConceptDef("assets", "USD", ("Assets",)))
+    sql = store_schema._mart_column(ConceptDef("assets", "USD", "instant", ("Assets",)))
     assert sql.endswith("AS assets")
     assert "argMaxIf(value," in sql
     assert "canonical_concept IN ('Assets')" in sql and "unit = 'USD'" in sql
+    assert "startsWith(form, '10-K')" in sql  # periodic-form restriction

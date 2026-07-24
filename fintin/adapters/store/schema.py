@@ -125,16 +125,23 @@ GROUP BY cik, canonical_concept, unit, period_start, period_end
 
 # Names interpolated into DDL are validated so the dictionary can grow without a
 # DDL-injection surface. Element local names are XBRL NCNames (alphanumeric); units
-# may include '/' (e.g. 'USD/shares').
+# may include '/' (e.g. 'USD/shares'); aliases are SQL identifiers.
 _ELEMENT_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
 _UNIT_RE = re.compile(r"^[A-Za-z0-9/]+$")
+_ALIAS_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+# Authoritative periodic reports only — a later-filed 8-K (or other non-periodic
+# form) must not override the audited 10-K/10-Q on recency (10-K, 10-Q and their /A).
+_PERIODIC_FORMS = "(startsWith(form, '10-K') OR startsWith(form, '10-Q'))"
 
 
 def _mart_column(concept: ConceptDef) -> str:
     """Resolve one screening concept as a wide-mart column (Approach B): the
-    latest-filed value across the concept's element union, with the AD-7 filing rank
-    `(filed_date, /A, accession, version)` and element list-position as the
-    deterministic tiebreak. NULL (not 0.0) when no element is present."""
+    latest-filed value across the concept's element union (periodic forms only),
+    with the AD-7 filing rank then element list-position then `raw_tag` as
+    deterministic tiebreaks. NULL (not 0.0) when no element is present."""
+    if not _ALIAS_RE.match(concept.alias):
+        raise ValueError(f"Invalid concept alias {concept.alias!r}: must be a SQL identifier.")
     if not _UNIT_RE.match(concept.unit):
         raise ValueError(f"Invalid concept unit {concept.unit!r}.")
     if not concept.elements:
@@ -144,16 +151,22 @@ def _mart_column(concept: ConceptDef) -> str:
         if not _ELEMENT_NAME_RE.match(el):
             raise ValueError(f"Invalid concept-dictionary element {el!r}: must be alphanumeric.")
     in_list = ", ".join(f"'{el}'" for el in concept.elements)
-    cond = f"canonical_concept IN ({in_list}) AND unit = '{concept.unit}'"
+    cond = f"canonical_concept IN ({in_list}) AND unit = '{concept.unit}' AND {_PERIODIC_FORMS}"
     # Element position priority: earlier in the list wins a same-filing rank tie.
     n = len(concept.elements)
     pos = ", ".join(f"canonical_concept = '{el}', {n - i}" for i, el in enumerate(concept.elements))
-    rank = f"(filed_date, toUInt8(endsWith(form, '/A')), accession, version, multiIf({pos}, 0))"
+    # Rank: latest-filed (AD-7: filed_date, /A, greatest accession, ingest version),
+    # then element position, then raw_tag — fully deterministic (no cross-namespace tie).
+    rank = f"(filed_date, toUInt8(endsWith(form, '/A')), accession, version, multiIf({pos}, 0), raw_tag)"
     # if()-guard keeps "absent" distinct from a real 0.0 (argMaxIf returns 0 on no match).
     return f"if(countIf({cond}) > 0, argMaxIf(value, {rank}, {cond}), NULL) AS {concept.alias}"
 
 
 def _build_screening_mart() -> str:
+    aliases = [c.alias for c in CONCEPT_DICTIONARY]
+    dupes = sorted({a for a in aliases if aliases.count(a) > 1})
+    if dupes:
+        raise ValueError(f"Duplicate concept aliases in the dictionary: {dupes}")
     cols = ",\n    ".join(_mart_column(c) for c in CONCEPT_DICTIONARY)
     return (
         "CREATE OR REPLACE VIEW screening_mart AS\n"
@@ -166,6 +179,32 @@ def _build_screening_mart() -> str:
 
 SCREENING_MART = _build_screening_mart()
 
+
+# Cross-statement screening surface (AD-8) — one row per income (duration) period
+# with the balance-sheet instant AS OF period_end joined on. The base screening_mart
+# keys on (period_start, period_end), so flows (income, durations) and stocks
+# (balance sheet, instants) land in SEPARATE rows; this companion collapses them so a
+# single screen can mix them (ROA, leverage, per-share). Duration concepts come from
+# the income row; instant concepts from the balance-sheet row whose instant date ==
+# the income period_end.
+def _build_screening_wide() -> str:
+    dur = [c.alias for c in CONCEPT_DICTIONARY if c.period_type == "duration"]
+    inst = [c.alias for c in CONCEPT_DICTIONARY if c.period_type == "instant"]
+    dur_cols = ",\n    ".join(f"d.{a} AS {a}" for a in dur)
+    inst_cols = ",\n    ".join(f"b.{a} AS {a}" for a in inst)
+    return (
+        "CREATE OR REPLACE VIEW screening_wide AS\n"
+        "SELECT\n    d.cik AS cik,\n    d.period_start AS period_start,\n    d.period_end AS period_end,\n    "
+        f"{dur_cols},\n    {inst_cols}\n"
+        "FROM screening_mart AS d\n"
+        "LEFT JOIN screening_mart AS b\n"
+        "  ON b.cik = d.cik AND b.period_start = d.period_end AND b.period_end = d.period_end\n"
+        "WHERE d.period_start < d.period_end"
+    )
+
+
+SCREENING_WIDE = _build_screening_wide()
+
 # Strict creation order — MV + mart created before any insert (AD-18).
 SCHEMA_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("raw_fact", RAW_FACT),
@@ -173,6 +212,7 @@ SCHEMA_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("resolved_fact", RESOLVED_FACT),
     ("resolved_fact_mv", RESOLVED_FACT_MV),
     ("screening_mart", SCREENING_MART),
+    ("screening_wide", SCREENING_WIDE),
 )
 
 
