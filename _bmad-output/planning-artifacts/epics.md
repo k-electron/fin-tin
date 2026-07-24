@@ -172,17 +172,19 @@ So that the raw local mirror exists for that company.
 **Given** the same CIK is ingested twice **Then** Tier 0 is unchanged on read (idempotent insert; ingest-monotonic version; FINAL/argMax) (AD-6).
 **Given** a tag outside the standard taxonomies **Then** it is not stored as a mapped concept (AD-9 scope).
 
-### Story 1.5: Map raw facts to canonical Tier 1
+### Story 1.5: Map raw facts to canonical Tier 1 (standard-element concepts)
 
 As the builder,
-I want Tier 0 facts mapped to canonical concepts in Tier 1 with zero network,
-So that facts become cross-company comparable.
+I want Tier 0 facts projected into Tier 1 keyed by their standard XBRL element, with zero network,
+So that every fact is addressable by an exact, unambiguous standard concept.
 
 **Acceptance Criteria:**
 
-**Given** Tier 0 has a company's facts **When** I run the mapping **Then** `canonical_fact` is populated via the edgartools standardization taxonomy, keyed by raw-fact identity with `canonical_concept` + `taxonomy_version` as attributes, issuing zero EDGAR requests (FR-4, AD-4, AD-9).
-**Given** a raw tag edgartools cannot standardize **Then** no `canonical_fact` row is created for it (remains only in Tier 0).
-**Given** the mapping is re-run **Then** it is an in-place upsert with no orphaned/duplicate rows (AD-5, AD-6).
+**Given** Tier 0 has a company's facts **When** I run the projection **Then** `canonical_fact` is populated with `canonical_concept` = the fact's standard element local name (e.g. `Assets`, `RevenueFromContractWithCustomerExcludingAssessedTax`) — a 1:1, lossless projection of `raw_tag` (namespace stripped), keyed by raw-fact identity, issuing zero EDGAR/network requests (FR-4, AD-4, AD-9).
+**Given** every ingested fact is already `us-gaap`/`dei`/`srt` scope (AD-9/AD-15) **Then** every Tier 0 fact projects to exactly one Tier 1 row — no statistical standardization and no "unmappable" drop; `canonical_concept` is exact and unambiguous by construction, and each row carries `taxonomy_version` (carried over from Tier 0).
+**Given** the projection is re-run **Then** it is an in-place upsert with no orphaned/duplicate rows on read (ingest-monotonic version; ReplacingMergeTree; FINAL) (AD-5, AD-6).
+
+_Cross-company screening concepts (revenue, net income, …) are NOT built here — they are the versioned concept dictionary over these elements, delivered in Story 1.6 (AD-8/AD-9)._
 
 ### Story 1.6: Resolve latest-filed-wins and screen via the wide mart
 
@@ -192,9 +194,10 @@ So that a SQL screen returns trustworthy (post-revision) numbers.
 
 **Acceptance Criteria:**
 
-**Given** multiple filed versions of the same (concept, unit, period) **When** I query the mart **Then** it returns the most-recently-filed value, tiebreak prefer `/A` then greatest accession (FR-5, AD-7).
+**Given** multiple filed versions of the same (element, unit, period) **When** I query the mart **Then** it returns the most-recently-filed value, tiebreak prefer `/A` then greatest accession (FR-5, AD-7).
 **Given** the restatement fixture (two filings of one period, different `filed_date`, differing values) **When** resolved **Then** the newer value wins — **this AC is required; it is the product-defining test.**
-**Given** Tier 1 receives inserts **When** I query **Then** the mart reflects them (auto-populated) presented **wide**: one row per `(cik, period)` with canonical concepts as columns (FR-13, AD-8).
+**Given** a versioned **concept dictionary** (each screening concept = an ordered list of standard elements: FASB-primary + observed-frequency-ranked fallbacks) **When** the mart resolves a concept for a `(cik, period)` **Then** it returns the **latest-filed** value across the *union* of that concept's elements, breaking ties deterministically by element list-position (then the AD-7 filing tiebreak) — so recency is respected (AD-7) AND multiple elements collapsing to one screening concept never produce a nondeterministic value (AD-8, AD-9). _(Position-first resolution is insufficient: it can return a stale or subtotal value when a period is reported/restated under different elements across filings.)_
+**Given** Tier 1 receives inserts **When** I query **Then** the mart reflects them (auto-populated) presented **wide**: one row per `(cik, period)` with screening concepts as columns (FR-13, AD-8).
 **Given** a SQL screen (concept > threshold for a period) **When** run against the mart **Then** it returns the matching company-period rows.
 **Given** a representative cross-sectional screen over the mart **When** run on the developer laptop **Then** it returns in single-digit seconds — a soft NFR-3 sanity target (regression tripwire), not a hard SLA.
 

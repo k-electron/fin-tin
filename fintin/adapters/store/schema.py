@@ -31,6 +31,8 @@ Key invariants:
 
 from __future__ import annotations
 
+import re
+
 # Tier 0 — immutable raw landing (AD-6, AD-14, AD-15, AD-17)
 RAW_FACT = """
 CREATE TABLE IF NOT EXISTS raw_fact (
@@ -100,23 +102,71 @@ FROM canonical_fact
 GROUP BY cik, canonical_concept, unit, period_start, period_end
 """
 
-# Wide screening mart (AD-8) — one row per (cik, period_start, period_end), concepts as columns.
-# Curated starter set of edgartools standardized labels; extend as the mapping (Story 1.5) lands.
-# Each column: NULL when the concept is absent for the (cik, period) — distinct from a real 0.0;
-# monetary concepts are pinned to unit='USD' (v1 is us-gaap USD-only) so no unit collapses silently.
-SCREENING_MART = """
-CREATE OR REPLACE VIEW screening_mart AS
-SELECT
-    cik,
-    period_start,
-    period_end,
-    if(countIf(canonical_concept = 'Revenues'      AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Revenues'      AND unit = 'USD'), NULL) AS revenues,
-    if(countIf(canonical_concept = 'NetIncomeLoss'  AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'NetIncomeLoss'  AND unit = 'USD'), NULL) AS net_income,
-    if(countIf(canonical_concept = 'Assets'         AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Assets'         AND unit = 'USD'), NULL) AS assets,
-    if(countIf(canonical_concept = 'Liabilities'    AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Liabilities'    AND unit = 'USD'), NULL) AS liabilities
-FROM resolved_fact
-GROUP BY cik, period_start, period_end
-"""
+# Wide screening mart (AD-8) — one row per (cik, period_start, period_end).
+#
+# SEED CONCEPT DICTIONARY (AD-9): each screening column maps to an ORDERED list of
+# standard us-gaap elements; the mart resolves the value of the FIRST PRESENT
+# element for a (cik, period) via `multiIf` (deterministic precedence). This is
+# where synonymous elements are unified, and it is what makes a filing that reports
+# several same-concept elements resolve deterministically. `canonical_concept` is
+# the element verbatim (AD-9), so these lists compare directly against Tier 1.
+# Ordering = FASB-primary first, then observed-frequency fallbacks.
+#
+# This inline seed covers the headline concepts; Story 1.6 formalizes it into a
+# versioned dictionary artifact and expands coverage. Monetary concepts are pinned
+# to unit='USD' (v1 is us-gaap USD-only). A column is NULL when none of its elements
+# is present for the (cik, period) — distinct from a real 0.0.
+CONCEPT_DICTIONARY: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "revenues",
+        (
+            "RevenueFromContractWithCustomerExcludingAssessedTax",  # ASC 606 primary
+            "Revenues",
+            "SalesRevenueNet",
+            "RevenueFromContractWithCustomerIncludingAssessedTax",
+        ),
+    ),
+    ("net_income", ("NetIncomeLoss", "ProfitLoss")),
+    ("assets", ("Assets",)),
+    ("liabilities", ("Liabilities",)),
+)
+
+
+# XBRL element local names are NCNames; the ones we map are alphanumeric. Validate
+# before interpolating into DDL so the concept dictionary can grow (Story 1.6, when
+# it may be sourced from a non-literal) without opening a DDL-injection surface.
+_ELEMENT_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
+def _mart_column(alias: str, elements: tuple[str, ...]) -> str:
+    """First-present `multiIf` column over an ordered element list."""
+    if not elements:
+        # An empty list would otherwise emit `multiIf(, NULL)` — a syntax error that
+        # breaks schema-init. A concept with no elements resolves to NULL.
+        return f"CAST(NULL AS Nullable(Float64)) AS {alias}"
+    branches: list[str] = []
+    for el in elements:
+        if not _ELEMENT_NAME_RE.match(el):
+            raise ValueError(
+                f"Invalid concept-dictionary element {el!r}: must be alphanumeric."
+            )
+        pred = f"canonical_concept = '{el}' AND unit = 'USD'"
+        branches.append(f"countIf({pred}) > 0, argMaxMergeIf(value_state, {pred})")
+    return f"multiIf({', '.join(branches)}, NULL) AS {alias}"
+
+
+def _build_screening_mart() -> str:
+    cols = ",\n    ".join(_mart_column(alias, els) for alias, els in CONCEPT_DICTIONARY)
+    return (
+        "CREATE OR REPLACE VIEW screening_mart AS\n"
+        "SELECT\n    cik,\n    period_start,\n    period_end,\n    "
+        f"{cols}\n"
+        "FROM resolved_fact\n"
+        "GROUP BY cik, period_start, period_end"
+    )
+
+
+SCREENING_MART = _build_screening_mart()
 
 # Strict creation order — MV + mart created before any insert (AD-18).
 SCHEMA_STATEMENTS: tuple[tuple[str, str], ...] = (

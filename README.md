@@ -34,6 +34,38 @@ uv run fintin check-connection
 the project's virtual environment; invoke it via `uv run fintin ...` unless you
 have activated `.venv`.)
 
+## Pipeline
+
+Data is derived one way — EDGAR → **Tier 0** (raw) → **Tier 1** (canonical) →
+resolution → **wide screening mart**:
+
+```bash
+# 1. Create the store schema (idempotent; also refreshes the mart view)
+uv run fintin schema-init
+
+# 2. Land one company's raw facts into Tier 0 (hits EDGAR — needs a real
+#    contact_email in fintin.toml; rate-limited & fair-access compliant)
+uv run fintin ingest-company 320193
+
+# 3. Project Tier 0 → canonical Tier 1. canonical_concept = the standard XBRL
+#    element itself (e.g. Assets, RevenueFromContractWithCustomerExcludingAssessedTax),
+#    a 1:1 lossless projection. OFFLINE — no EDGAR, so it needs no contact email.
+uv run fintin map-canonical 320193
+```
+
+Every standard-taxonomy fact projects 1:1 to Tier 1 (the concept is exact and
+unambiguous — the FASB element itself, not a statistical standardization). Re-running
+either command is idempotent on read (a higher ingest-monotonic `version` supersedes;
+readers use `FINAL`). The `screening_mart` view then exposes one row per `(cik, period)`
+with well-known concepts (`revenues`, `net_income`, `assets`, `liabilities`) as columns;
+each resolves to the **first present** element in a curated, ordered element list (so a
+filer using any of several synonymous elements — e.g. `SalesRevenueNet` vs
+`RevenueFromContractWithCustomerExcludingAssessedTax` — still lands under `revenues`).
+
+> **Note:** `schema-init` is create-only for tables, but the `screening_mart` view
+> is `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up mart
+> changes on an existing database.
+
 ## Configuration
 
 All configuration lives in a single `fintin.toml`. **This repo is public, so

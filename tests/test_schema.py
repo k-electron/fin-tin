@@ -226,3 +226,27 @@ def test_reingest_higher_version_supersedes(schema_client):
     assert resolved() == 100.0  # higher version wins pre-merge
     client.command("OPTIMIZE TABLE resolved_fact FINAL")
     assert resolved() == 100.0  # ...and stays correct across a merge
+
+
+# --- concept-dictionary mart-column builder guards (pure; no ClickHouse) --------
+
+
+def test_mart_column_empty_list_yields_null_not_syntax_error():
+    """A concept with an empty element list must NOT emit `multiIf(, NULL)` (a
+    syntax error that would break schema-init for the whole DB)."""
+    sql = store_schema._mart_column("foo", ())
+    assert sql == "CAST(NULL AS Nullable(Float64)) AS foo"
+    assert "multiIf(" not in sql
+
+
+def test_mart_column_rejects_non_alphanumeric_element():
+    """Element names are interpolated into DDL — a non-alphanumeric name (e.g. one
+    smuggling a quote) is rejected, so a future sourced dictionary can't inject."""
+    with pytest.raises(ValueError):
+        store_schema._mart_column("foo", ("Bad'; DROP TABLE x;--",))
+
+
+def test_mart_column_single_element_is_valid_multiif():
+    sql = store_schema._mart_column("assets", ("Assets",))
+    assert sql.startswith("multiIf(") and sql.endswith("AS assets")
+    assert "canonical_concept = 'Assets'" in sql

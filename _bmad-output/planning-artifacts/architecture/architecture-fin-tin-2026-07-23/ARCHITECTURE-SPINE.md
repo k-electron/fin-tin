@@ -7,7 +7,7 @@ paradigm: Ports & Adapters (Hexagonal) around a pure ingestion engine; layered d
 scope: fin-tin v1 — local EDGAR→ClickHouse financial-statement query tool (S&P 500 Universe, us-gaap only)
 status: final
 created: 2026-07-23
-updated: 2026-07-23
+updated: 2026-07-24
 binds: [FR-1, FR-2, FR-3, FR-4, FR-5, FR-6, FR-7, FR-8, FR-9, FR-10, FR-11, FR-12, FR-13, FR-14]
 sources:
   - ../../planning-artifacts/prds/prd-fin-tin-2026-07-23/prd.md
@@ -87,12 +87,12 @@ graph LR
 ### AD-8 — Resolution MV + wide screening mart
 - **Binds:** mart, query surface (FR-13)
 - **Prevents:** divergent resolution/refresh logic; a stale, manually-refreshed, or long-shaped mart
-- **Rule:** Two derived layers over Tier 1: (1) a **Resolution MV** — `AggregatingMergeTree` storing `argMaxState(value, filed_date)` (with the AD-7 tiebreak) per `(cik, canonical_concept, unit, period_start, period_end)` — auto-populated on Tier 1 insert; (2) a **wide Screening Mart** over it, presenting **one row per `(cik, period_start, period_end)` with canonical concepts as columns** (derived-metric columns deferred, §Deferred) — this is the screening surface (FR-13). Read the resolution via `argMaxMerge`. Both are created before any backfill insert (AD-18). Caveat: a re-map changes a fact's `canonical_concept`, which the MV cannot retract from a prior column contribution — a re-map (deferred) therefore requires a mart rebuild, as does a Tier 1 recovery (AD-14).
+- **Rule:** Two derived layers over Tier 1: (1) a **Resolution MV** — `AggregatingMergeTree` storing `argMaxState(value, (filed_date, is_amendment, accession, version))` (AD-7 tiebreak) per `(cik, canonical_concept, unit, period_start, period_end)` where `canonical_concept` is the standard **element** (AD-9) — auto-populated on Tier 1 insert; (2) a **wide Screening Mart** over it, presenting **one row per `(cik, period_start, period_end)`** whose columns are the **concept dictionary**: each screening concept resolves to the value of the **first present** element in its ordered element list (deterministic precedence over synonymous elements — this is where cross-company unification happens, AD-9; derived-metric columns deferred, §Deferred). This is the screening surface (FR-13). Read the resolution via `argMaxMerge`. Both are created before any backfill insert (AD-18). The concept dictionary is a **versioned artifact owned by `adapters/store`**; adding/reordering a concept's element list is a mart-view change (`CREATE OR REPLACE`), not a Tier 1 rebuild. Because `canonical_concept` is the element verbatim (never a re-mapped label), Tier 1 recovery re-derives it losslessly and there is no MV column-retraction hazard — only a dictionary change reshapes the mart.
 
-### AD-9 — Concept dimension = edgartools taxonomy; standard taxonomies only `[ADOPTED]`
-- **Binds:** the Tier 0 → Tier 1 mapping, the concept space
-- **Prevents:** incomparable cross-company concepts; scope creep into custom extensions
-- **Rule:** Canonical concepts come solely from the edgartools standardization taxonomy. Only `us-gaap`/`dei`/`srt` facts are ingested; unmappable tags remain in Tier 0 and never enter Tier 1 as canonical. Every Tier 1 row is stamped with `taxonomy_version` (the edgartools package version string, AD-14).
+### AD-9 — Concept dimension = the standard element; comparability via a curated concept dictionary `[ADOPTED]`
+- **Binds:** the Tier 0 → Tier 1 projection, the concept space, the screening mart
+- **Prevents:** incomparable concepts; a lossy/ambiguous statistical concept map; scope creep into custom extensions
+- **Rule:** The canonical concept is the **standard XBRL element itself** — Tier 1 `canonical_concept` = the `us-gaap`/`dei`/`srt` element local name (`Assets`, `RevenueFromContractWithCustomerExcludingAssessedTax`, …), a **1:1 lossless** projection of the Tier 0 `raw_tag` (namespace stripped). This is unambiguous and exact by construction: each element is FASB-defined and identical across filers, so **no statistical standardization is stored**. Only `us-gaap`/`dei`/`srt` facts are ingested; custom-extension elements are out of scope and surface as coverage gaps (FR-14), never silent errors. Cross-company **screening** concepts (revenue, net income, …) come from a **versioned concept dictionary** (AD-8): each concept = an ordered list of standard elements (FASB-primary + observed-frequency-ranked fallbacks), resolved by **first-present precedence**. edgartools' *learned* standardization taxonomy is NOT authoritative (avg confidence ≈ 0.5; ~80% of its concepts collapse many tags) and is used only, if at all, as a research aid to seed dictionary candidates — never as the stored concept. Every Tier 1 row carries `taxonomy_version` (carried over from Tier 0; AD-14).
 
 ### AD-10 — Work is derived; "catch up to today" is the only behavior `[ADOPTED]`
 - **Binds:** core reconciler, ingestion
@@ -144,7 +144,7 @@ graph LR
 | Concern | Convention |
 | --- | --- |
 | Naming — Python | Packages/modules `snake_case` under `fintin/`; one adapter package per port. |
-| Naming — ClickHouse | Tables/columns `snake_case`: `raw_fact` (Tier 0), `canonical_fact` (Tier 1), `resolved_fact` (MV), `screening_mart` (wide view). Canonical concept values = edgartools standardized labels verbatim. |
+| Naming — ClickHouse | Tables/columns `snake_case`: `raw_fact` (Tier 0), `canonical_fact` (Tier 1), `resolved_fact` (MV), `screening_mart` (wide view). `canonical_concept` values = the `us-gaap`/`dei`/`srt` element local name verbatim (AD-9); screening-concept mart columns are defined by the versioned concept dictionary (AD-8). |
 | Identity | `cik` = `UInt32` (numeric canonical; zero-padded to 10 digits only for SEC URLs). `accession` = dashed 20-char canonical form (`0000320193-24-000123`), normalized on ingest. |
 | Data & formats | `value` = `Float64` (screening-adequate; Decimal deferred if exactness ever needed). `period_start`/`period_end`/`filed_date` = `Date` (per AD-17). `unit` = `String` (`USD`, `shares`, `USD/shares`). `taxonomy_version` = `String`. |
 | State & mutation | Insert-only into `ReplacingMergeTree` with ingest-monotonic `version` (AD-6); no `UPDATE`/`DELETE` in normal ops; reads via `FINAL`/`argMax`. |
@@ -234,8 +234,9 @@ fin-tin/
 - **Dynamic S&P 500 membership sourcing** — v1 uses a static config list.
 - **Proactive integrity scrub (`last_verified_at`) + at-rest hash automation** — Should; the detection side of AD-14.
 - **Derived-metrics columns (margins/ratios)** — Should; additional columns on the wide Mart (AD-8).
+- **Concept-dictionary expansion & automation** — Should; v1 curates a small dictionary (the headline screening concepts) seeded by observed frequency. Forward work: broaden concept coverage, pin the dictionary to a FASB UGT taxonomy year, and auto-seed candidate element lists from the FASB calculation linkbase / SEC Frames frequency instead of by hand (AD-8, AD-9).
 - **Dimensional/segment facts** — Won't (v1); would extend the AD-15/AD-5 key with a `dimensions` term.
-- **Re-map (taxonomy vX→vY) as a first-class command** — Could; the storage mechanism exists (AD-5, AD-6, AD-11) but re-map **requires a mart rebuild** (AD-8 caveat) — must be handled when built.
+- **Re-map (taxonomy vX→vY) as a first-class command** — largely **obviated by AD-9's pivot**: `canonical_concept` is the element verbatim, so there is no lossy concept re-mapping and no MV column-retraction hazard. Changing cross-company unification is now a concept-dictionary edit (a `CREATE OR REPLACE` mart-view change, AD-8), not a Tier 1 re-map. Retained only for the narrow case of re-projecting Tier 1 after a Tier 0 recovery (AD-14), which the AD-5/AD-6 upsert already handles.
 - **cron / RSS / HTTP triggers; "catch up before query"** — Could; each a thin wrapper per AD-2.
 - **Point-in-time / backtesting surface (`pit_mode`); 8-K Item 4.02 early-warning feed** — Could.
 - **Ad-hoc reactive corruption repair + ephemeral suspect-accession queue** — Won't (v1); the one deliberate exception to AD-1.
