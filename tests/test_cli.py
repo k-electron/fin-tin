@@ -32,3 +32,16 @@ def test_malformed_config_reports_clean_error(tmp_path):
     assert result.exit_code != 0
     assert "Config error" in result.output
     assert "Traceback" not in result.output
+
+
+def test_help_lists_schema_init():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "schema-init" in result.output
+
+
+def test_schema_init_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["schema-init", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output

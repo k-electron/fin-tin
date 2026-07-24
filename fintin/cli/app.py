@@ -110,14 +110,20 @@ def schema_init_command(
         cfg.clickhouse.port,
         cfg.clickhouse.database,
     )
+
+    # Surface connection/auth/missing-database problems clearly (get_client itself
+    # does not wrap driver errors), so a DDL failure below can't be mislabelled.
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
     client = None
     try:
         client = get_client(cfg.clickhouse)
         created = store_schema.create_schema(client)
-    except StoreConnectionError as exc:
-        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
-    except Exception as exc:  # DDL error
+    except Exception as exc:  # DDL error (connection already verified above)
         typer.secho(f"Schema init failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     finally:

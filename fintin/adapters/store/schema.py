@@ -9,14 +9,21 @@ insert (ClickHouse materialized views do not backfill pre-existing rows):
 All DDL is idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE VIEW`), so a second
 run is a no-op. No other module may issue DDL.
 
+NOTE: schema-init is **create-only** (no migrations in v1). `IF NOT EXISTS`
+keeps an existing object as-is, so changing a table/MV definition requires a
+manual drop/recreate (or `docker compose down -v`) — see
+`_bmad-output/implementation-artifacts/deferred-work.md`.
+
 Key invariants:
 - AD-5/AD-15: Tier 0 and Tier 1 share the identity key
   (accession, raw_tag, period_start, period_end, unit).
 - AD-6: ReplacingMergeTree(version) with an INGEST-MONOTONIC `version` (not
-  filed_date), so a recovery re-ingest supersedes a corrupted prior copy.
+  filed_date), so a recovery re-ingest supersedes a corrupted prior copy — the
+  resolution rank carries `version` as its least-significant term so this
+  supersession also holds at the query surface.
 - AD-7: latest-filed-wins via argMax over the rank tuple
-  (filed_date, is_amendment, accession) — deterministic tiebreak (/A first,
-  then greatest accession).
+  (filed_date, is_amendment, accession, version) — deterministic tiebreak
+  (/A first, then greatest accession, then latest ingest).
 - AD-8: resolution MV (AggregatingMergeTree, argMaxState) auto-populated on
   Tier 1 insert; wide screening mart over it.
 - AD-17: instant facts period_start = period_end; duration period_start < period_end.
@@ -74,7 +81,7 @@ CREATE TABLE IF NOT EXISTS resolved_fact (
     unit              String,
     period_start      Date,
     period_end        Date,
-    value_state       AggregateFunction(argMax, Float64, Tuple(Date, UInt8, String))
+    value_state       AggregateFunction(argMax, Float64, Tuple(Date, UInt8, String, UInt64))
 ) ENGINE = AggregatingMergeTree
 ORDER BY (cik, canonical_concept, unit, period_start, period_end)
 """
@@ -88,23 +95,25 @@ SELECT
     unit,
     period_start,
     period_end,
-    argMaxState(value, (filed_date, toUInt8(endsWith(form, '/A')), accession)) AS value_state
+    argMaxState(value, (filed_date, toUInt8(endsWith(form, '/A')), accession, version)) AS value_state
 FROM canonical_fact
 GROUP BY cik, canonical_concept, unit, period_start, period_end
 """
 
 # Wide screening mart (AD-8) — one row per (cik, period_start, period_end), concepts as columns.
 # Curated starter set of edgartools standardized labels; extend as the mapping (Story 1.5) lands.
+# Each column: NULL when the concept is absent for the (cik, period) — distinct from a real 0.0;
+# monetary concepts are pinned to unit='USD' (v1 is us-gaap USD-only) so no unit collapses silently.
 SCREENING_MART = """
 CREATE OR REPLACE VIEW screening_mart AS
 SELECT
     cik,
     period_start,
     period_end,
-    argMaxMergeIf(value_state, canonical_concept = 'Revenues')      AS revenues,
-    argMaxMergeIf(value_state, canonical_concept = 'NetIncomeLoss') AS net_income,
-    argMaxMergeIf(value_state, canonical_concept = 'Assets')        AS assets,
-    argMaxMergeIf(value_state, canonical_concept = 'Liabilities')   AS liabilities
+    if(countIf(canonical_concept = 'Revenues'      AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Revenues'      AND unit = 'USD'), NULL) AS revenues,
+    if(countIf(canonical_concept = 'NetIncomeLoss'  AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'NetIncomeLoss'  AND unit = 'USD'), NULL) AS net_income,
+    if(countIf(canonical_concept = 'Assets'         AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Assets'         AND unit = 'USD'), NULL) AS assets,
+    if(countIf(canonical_concept = 'Liabilities'    AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Liabilities'    AND unit = 'USD'), NULL) AS liabilities
 FROM resolved_fact
 GROUP BY cik, period_start, period_end
 """

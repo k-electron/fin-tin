@@ -37,7 +37,7 @@ def get_client(
         port=cfg.port,
         username=cfg.username,
         password=cfg.password,
-        database=database if database is not None else cfg.database,
+        database=database or cfg.database,  # blank/None override falls back to config
     )
     if connect_timeout is not None:
         kwargs["connect_timeout"] = connect_timeout

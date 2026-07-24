@@ -4,7 +4,7 @@ baseline_commit: 00dac138f08ab5bed8627629fda278be2b965dfa
 
 # Story 1.2: Store schema and DDL (single owner, correct creation order)
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -48,6 +48,21 @@ so that ingestion and querying have a correct, mutation-safe schema before any d
   - [x] Idempotency: run `create_schema` twice → no error, object counts unchanged (AC-3).
   - [x] AD-17 representation (AC-4): insert two synthetic `canonical_fact` rows directly — an **instant** (`period_start = period_end`) and a **duration** (`period_start < period_end`) — and confirm both store and read back distinctly, and that `resolved_fact` resolves each. (This is a schema-level check using hand-written rows; real ingestion is Story 1.4.)
   - [x] A latest-filed-wins smoke check (optional but valuable, pre-echoes Story 1.6): insert two `canonical_fact` rows for one `(cik, concept, unit, period)` with different `filed_date` → `argMaxMerge` returns the newer value.
+
+### Review Findings
+
+_Adversarial code review (2026-07-23) — 3 parallel layers, all verified live against CH 26.3. Triage: 0 decision-needed, 7 patch, 1 deferred, 2 dismissed. AC-1..AC-4 all satisfied; no scope-creep or architecture violations. One HIGH correctness defect (F1) in the resolution layer._
+
+- [x] [Review][Patch] (high) Resolution rank tuple omits `version` — a recovery re-ingest (same accession/filed_date/form, higher `version`, corrected `value`) ties on the rank and `argMax` picks arbitrarily, so `resolved_fact`/`screening_mart` can serve the STALE value and flip across background merges. Breaks AD-6 supersession at the query surface (threatens SM-1). Fix: append `version` as the **least-significant** rank element — `argMaxState(value, (filed_date, toUInt8(endsWith(form,'/A')), accession, version))` — and widen the state type to `AggregateFunction(argMax, Float64, Tuple(Date, UInt8, String, UInt64))`. [fintin/adapters/store/schema.py: RESOLVED_FACT / RESOLVED_FACT_MV]
+- [x] [Review][Patch] (medium) Wide mart returns `0.0` (Float64 default), not `NULL`, for a concept absent in a `(cik, period)` group — "not reported" is indistinguishable from a real zero (breaks `> 0` screens / ratios). Fix: emit `Nullable` per column, e.g. `if(countIf(canonical_concept='X') > 0, argMaxMergeIf(value_state, canonical_concept='X'), NULL)`. [schema.py: SCREENING_MART]
+- [x] [Review][Patch] (medium) Wide mart omits `unit` from GROUP BY while `resolved_fact` keys on it — a concept reported in >1 unit collapses to an arbitrary one (nondeterministic across merges). Low real risk in v1 (us-gaap USD-only) but cheap to harden: pin monetary concept columns to `unit = 'USD'`. [schema.py: SCREENING_MART]
+- [x] [Review][Patch] (medium) `schema-init` has a dead `except StoreConnectionError` branch — `get_client` doesn't wrap driver errors, so a down server / missing DB is caught by the generic handler and mislabeled "Schema init failed" (should read "Connection failed"). Fix: `check_connection(cfg.clickhouse)` first, then create_schema; keep the generic branch only for real DDL errors. [fintin/cli/app.py: schema_init_command]
+- [x] [Review][Patch] (low) Test fixture `schema_client` acquires the client (and runs `CREATE DATABASE`) outside the `try/finally`, so a failure there leaks an orphan `fintin_test_*` DB; a raising `client.close()` also skips the DROP. Fix: move creation/acquisition inside `try`, suppress close errors so DROP always runs. [tests/test_schema.py]
+- [x] [Review][Patch] (low) Test gaps: no equal-`filed_date` tiebreak test (the spec-critical AD-7 rule), no re-ingest/`version`-supersession test (would guard F1), the amendment is inserted in one batch (never exercises the cross-ingest `AggregatingMergeTree` state merge), and no CLI-level `schema-init` test. Add these; tighten the `engine_full` assertion. [tests/test_schema.py, tests/test_cli.py]
+- [x] [Review][Patch] (low) `get_client(database="")` passes the empty string through (overrides to the server default) instead of falling back to `cfg.database`. Fix: guard with `if database` (truthy) or reject blank. [fintin/adapters/store/client.py: get_client]
+- [x] [Review][Defer] (medium) No schema-migration story — `CREATE … IF NOT EXISTS` silently keeps a stale table/MV if its DDL later changes (the F1 fix won't apply to an already-created deployment without a manual drop). Deferred: migrations are future work for a still-stabilizing v1 schema; a "create-only, DDL changes need manual drop/recreate" note is added now. [schema.py]
+
+_Dismissed (2): direct non-FINAL reads of `raw_fact`/`canonical_fact` return duplicates — by-design per AD-6 (readers use FINAL/argMax; the resolution layer is the intended read path); `create_schema` returns `list[str]` vs the spec's `-> None` — benign and used by the CLI._
 
 ## Dev Notes
 
@@ -211,7 +226,14 @@ claude-opus-4-8[1m] (Claude Opus 4.8, 1M context) — bmad-dev-story workflow.
 **New:**
 - `fintin/adapters/store/schema.py`
 - `tests/test_schema.py`
+- `_bmad-output/implementation-artifacts/deferred-work.md` (review — deferred migration item)
 
 **Modified:**
-- `fintin/adapters/store/client.py` (added `database` override to `get_client`)
-- `fintin/cli/app.py` (added `schema-init` command)
+- `fintin/adapters/store/client.py` (added `database` override to `get_client`; review: blank-override guard)
+- `fintin/cli/app.py` (added `schema-init` command; review: connection-error handling)
+- `tests/test_cli.py` (review: `schema-init` CLI tests)
+
+### Change Log
+
+- 2026-07-23 — Story 1.2 implemented: schema DDL, `schema-init` CLI, `get_client` database override. 20 tests.
+- 2026-07-23 — Code review (adversarial, 3 layers): 7 patch findings applied, 1 deferred (schema migrations → `deferred-work.md`), 2 dismissed. **F1 (HIGH):** appended `version` (least-significant) to the resolution rank tuple + widened the state to `Tuple(Date, UInt8, String, UInt64)` so a recovery re-ingest supersedes at the query surface (guarded by a new supersession test). Mart now returns NULL (not 0.0) for absent concepts and pins monetary columns to `unit='USD'`. `schema-init` reports connection failures via `check_connection`. Leak-safe test fixture; added tiebreak / version / CLI tests; `get_client("")` falls back to config. Reconciled the dev container's `default` schema (manual drop/recreate — the deferred migration gap). Suite: 25 passed. Status → done.
