@@ -208,23 +208,24 @@ def test_high_water_mark_returns_latest_filed_date(schema_client):
 
 
 @pytest.mark.integration
-def test_present_accessions_scoped_by_cik_and_window(schema_client):
+def test_present_accessions_returns_present_subset(schema_client):
+    # Membership by EXACT accession (AD-16), independent of cik/filed_date.
     insert_raw_facts(
         schema_client,
         [
-            # in universe, in window
-            _row(cik=320193, accession="0000320193-24-000001", filed_date=date(2024, 5, 1), content_hash="a"),
-            # in universe, BEFORE the window (filed_date < since) -> excluded
-            _row(cik=320193, accession="0000320193-23-000009", filed_date=date(2023, 1, 1), content_hash="b"),
-            # NOT in universe -> excluded
-            _row(cik=111111, accession="0000111111-24-000002", filed_date=date(2024, 5, 1), content_hash="c"),
+            _row(accession="0000320193-24-000001", filed_date=date(2024, 5, 1), content_hash="a"),
+            _row(accession="0000320193-23-000009", filed_date=date(2023, 1, 1), content_hash="b"),
         ],
     )
-    present = present_accessions(schema_client, ciks=[320193, 789019], since=date(2024, 1, 1))
-    assert present == {"0000320193-24-000001"}  # only in-universe AND in-window
+    # Query a candidate set: two present, one absent.
+    present = present_accessions(
+        schema_client,
+        accessions={"0000320193-24-000001", "0000320193-23-000009", "0000999999-24-000000"},
+    )
+    assert present == {"0000320193-24-000001", "0000320193-23-000009"}  # absent one excluded
 
 
 @pytest.mark.integration
-def test_present_accessions_empty_ciks_is_empty_no_query(schema_client):
+def test_present_accessions_empty_is_empty_no_query(schema_client):
     insert_raw_facts(schema_client, [_row(content_hash="a")])
-    assert present_accessions(schema_client, ciks=[], since=date(2000, 1, 1)) == set()
+    assert present_accessions(schema_client, accessions=[]) == set()

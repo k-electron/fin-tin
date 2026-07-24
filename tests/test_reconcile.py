@@ -38,6 +38,14 @@ def test_window_lookback_scales():
     assert start == date(2024, 5, 2)
 
 
+def test_window_clamps_future_dated_hwm():
+    # A corrupt future-dated HWM must not reverse the window (start <= end).
+    start, end = resolve_window(date(2025, 1, 1), lookback_days=7, today=date(2024, 6, 1))
+    assert end == date(2024, 6, 1)
+    assert start == date(2024, 5, 25)  # anchored at today, not the future hwm
+    assert start <= end
+
+
 # --- compute_work_list (AC-1, AC-2, AC-3) --------------------------------------
 
 
@@ -62,15 +70,16 @@ def test_new_and_amendment_accessions_included():
     assert any(i.form == "10-K/A" for i in work.items)
 
 
-def test_co_filed_duplicate_accessions_deduped():
+def test_co_filed_duplicate_accessions_deduped_deterministically():
     # The index has one row per (filing, filer); a co-filed accession repeats.
+    # Dedup keeps the SMALLEST cik regardless of index row order (deterministic).
     candidates = [
-        _wi("0000000001-24-000001", cik=1),
-        _wi("0000000001-24-000001", cik=2),  # same accession, co-filer
+        _wi("0000000001-24-000001", cik=7),  # larger cik listed FIRST
+        _wi("0000000001-24-000001", cik=2),  # same accession, smaller cik
     ]
     work = compute_work_list(candidates, present_accessions=set())
-    assert len(work.items) == 1  # deduped by accession (first-wins)
-    assert work.items[0].cik == 1
+    assert len(work.items) == 1  # deduped by accession
+    assert work.items[0].cik == 2  # min cik kept, not the first-listed
     assert work.scanned == 1
 
 

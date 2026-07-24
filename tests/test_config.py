@@ -283,6 +283,8 @@ def test_reconcile_lookback_parsed(tmp_path):
         "[reconcile]\nlookback_days = true\n",  # bool masquerading as int
         '[reconcile]\nlookback_days = "7"\n',  # not an int
         "[reconcile]\nlookback_days = 1.5\n",  # float
+        "[reconcile]\nlookback_days = 3651\n",  # above the 10-year cap
+        "[reconcile]\nlookback_days = 100000000000\n",  # absurd (would overflow timedelta)
     ],
 )
 def test_reconcile_validation_rejects(tmp_path, block):

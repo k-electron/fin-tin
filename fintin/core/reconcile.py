@@ -46,8 +46,10 @@ def resolve_window(
     filing filed just before the HWM but not yet committed is re-checked. ``hwm``
     is only a **scan-sizing hint**; on an empty store (``hwm is None``) the window
     is anchored at ``today`` (a bounded recent window — full history from empty is
-    the per-company backfill's job, Story 2.3), never the done-ness test."""
-    anchor = hwm if hwm is not None else today
+    the per-company backfill's job, Story 2.3), never the done-ness test. A
+    future-dated ``hwm`` (corrupt data) is clamped to ``today`` so the window never
+    reverses (``window_start <= window_end``)."""
+    anchor = min(hwm, today) if hwm is not None else today
     return anchor - timedelta(days=lookback_days), today
 
 
@@ -55,13 +57,17 @@ def compute_work_list(
     candidates: Iterable[WorkItem], present_accessions: Container[str]
 ) -> WorkList:
     """Diff index ``candidates`` against store ``present_accessions`` (AD-16
-    membership). Candidates are deduplicated by accession (first-wins — a co-filed
-    accession appears once per filer CIK in the index); an accession already in the
-    store is dropped (not re-fetched, AC-2); survivors are returned **sorted** by
-    ``(filed_date, accession)`` for deterministic output."""
+    membership). Candidates are deduplicated by accession — a co-filed accession
+    appears once per filer CIK in the index, so the row with the **smallest CIK**
+    is kept, making the retained attribution deterministic (independent of index
+    row order). An accession already in the store is dropped (not re-fetched,
+    AC-2); survivors are returned **sorted** by ``(filed_date, accession)`` for
+    deterministic output."""
     seen: dict[str, WorkItem] = {}
     for item in candidates:
-        seen.setdefault(item.accession, item)
+        existing = seen.get(item.accession)
+        if existing is None or item.cik < existing.cik:
+            seen[item.accession] = item
 
     already_present = 0
     items: list[WorkItem] = []

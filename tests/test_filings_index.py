@@ -75,6 +75,35 @@ def test_empty_universe_intersection_yields_nothing():
     assert _filings_to_work_items(_index_table(_ROWS), {999999}) == []
 
 
+def test_periodic_prefix_family_kept_nonperiodic_dropped():
+    # Parity with the mart's startsWith(10-K/10-Q): 10-KT (transition annual) is
+    # kept; a non-periodic 8-K is dropped.
+    rows = [
+        ("10-KT", "Apple", 320193, date(2024, 2, 1), "0000320193-24-000010"),
+        ("8-K", "Apple", 320193, date(2024, 3, 1), "0000320193-24-000011"),
+        ("10-Q", "Apple", 320193, date(2024, 4, 1), "0000320193-24-000012"),
+    ]
+    items = _filings_to_work_items(_index_table(rows), {320193})
+    forms = {i.form for i in items}
+    assert forms == {"10-KT", "10-Q"}  # 8-K excluded
+
+
+def test_cik_above_int32_does_not_crash():
+    # A Universe CIK above int32 max (valid UInt32) must not overflow pa.array.
+    items = _filings_to_work_items(_index_table(_ROWS), {3_000_000_000, 320193})
+    assert {i.cik for i in items} == {320193}  # the real match; no ArrowInvalid
+
+
+def test_null_filing_date_and_malformed_accession_dropped():
+    rows = [
+        ("10-K", "Apple", 320193, date(2024, 2, 1), "0000320193-24-000001"),  # good
+        ("10-K", "Apple", 320193, None, "0000320193-24-000002"),  # null filing_date
+        ("10-K", "Apple", 320193, date(2024, 2, 1), "not-an-accession"),  # malformed
+    ]
+    items = _filings_to_work_items(_index_table(rows), {320193})
+    assert [i.accession for i in items] == ["0000320193-24-000001"]  # only the good row
+
+
 def test_fetch_empty_ciks_short_circuits(monkeypatch):
     # No CIKs → no request at all.
     called = False

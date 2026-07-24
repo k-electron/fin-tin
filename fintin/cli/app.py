@@ -470,15 +470,20 @@ def work_list_command(
     client = None
     try:
         client = get_client(cfg.clickhouse)
+        # HWM sizes the index scan window (a hint, AD-16) — never the done-ness test.
         hwm = high_water_mark(client)
         window_start, window_end = resolve_window(
             hwm, cfg.reconcile.lookback_days, date.today()
         )
-        present = present_accessions(client, ciks=resolved.ciks, since=window_start)
+        # Discover candidates from EDGAR's index, THEN check membership by their
+        # exact accessions (AD-16 authority — decoupled from any date).
         candidates = fetch_work_candidates(
             edgar_client,
             filing_date=f"{window_start.isoformat()}:{window_end.isoformat()}",
             ciks=resolved.ciks,
+        )
+        present = present_accessions(
+            client, accessions={c.accession for c in candidates}
         )
         work = compute_work_list(candidates, present)
     except EdgarThrottleError as exc:

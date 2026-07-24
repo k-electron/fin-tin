@@ -75,19 +75,20 @@ def high_water_mark(client) -> date | None:
     return rows[0][1]
 
 
-def present_accessions(
-    client, *, ciks: Collection[int], since: date
-) -> set[str]:
-    """The set of accessions already in ``raw_fact`` for ``ciks`` filed on/after
-    ``since`` — the AD-16 membership check over the scan window. Parameterized
-    (never string-interpolated). Empty ``ciks`` → ``set()`` with no query. No
-    ``FINAL`` needed: membership is existence, and dedup rows share an accession."""
-    cik_list = [int(c) for c in ciks]
-    if not cik_list:
+def present_accessions(client, *, accessions: Collection[str]) -> set[str]:
+    """Of the given ``accessions``, the subset already present in ``raw_fact`` — the
+    AD-16 membership check, by **exact accession** (the correctness authority). Not
+    windowed by any date: the scan window sizes the EDGAR *index* fetch, never the
+    store membership (a candidate's index ``filing_date`` and its stored
+    ``filed_date`` come from different SEC sources and could disagree). Parameterized
+    (never string-interpolated). ``accession`` is ``raw_fact``'s leading sort key, so
+    the ``IN`` lookup is an efficient primary-key scan. Empty input → ``set()`` with
+    no query. No ``FINAL``: membership is existence, and dedup rows share an accession."""
+    acc_list = [str(a) for a in accessions]
+    if not acc_list:
         return set()
     result = client.query(
-        "SELECT DISTINCT accession FROM raw_fact "
-        "WHERE cik IN %(ciks)s AND filed_date >= %(since)s",
-        parameters={"ciks": cik_list, "since": since},
+        "SELECT DISTINCT accession FROM raw_fact WHERE accession IN %(accessions)s",
+        parameters={"accessions": acc_list},
     )
     return {row[0] for row in result.result_rows}

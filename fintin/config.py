@@ -75,6 +75,9 @@ _CIK_MAX = 4_294_967_295
 # Default reordering-safe lookback window (AD-16) — days before the store's
 # high-water mark to re-scan for stragglers/restatements. Tunable via config.
 DEFAULT_LOOKBACK_DAYS = 7
+# Upper bound — a lookback is a filing-order-skew window, not a backfill horizon.
+# Caps quarterly-index fan-out and guards against a timedelta OverflowError.
+MAX_LOOKBACK_DAYS = 3650  # ~10 years
 
 
 @dataclass(frozen=True)
@@ -305,8 +308,10 @@ def _parse_reconcile(rc: dict, path: Path) -> ReconcileConfig:
         raise ConfigError(
             f"[reconcile].lookback_days in {path} must be an integer, got {lookback!r}."
         )
-    if lookback < 1:
+    if not (1 <= lookback <= MAX_LOOKBACK_DAYS):
         raise ConfigError(
-            f"[reconcile].lookback_days in {path} must be >= 1, got {lookback}."
+            f"[reconcile].lookback_days in {path} must be between 1 and "
+            f"{MAX_LOOKBACK_DAYS} (a lookback is a filing-skew window, not a "
+            f"backfill horizon), got {lookback}."
         )
     return ReconcileConfig(lookback_days=lookback)
