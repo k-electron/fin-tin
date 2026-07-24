@@ -396,6 +396,129 @@ def universe_command(
         typer.echo(" ".join(str(c) for c in resolved.ciks))
 
 
+@app.command("work-list")
+def work_list_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    show_items: bool = typer.Option(
+        False,
+        "--show-items",
+        help="Print each outstanding filing (accession, cik, form, filed_date).",
+    ),
+) -> None:
+    """Preview outstanding ingestion work: EDGAR-index filings over the lookback
+    window (for the Universe) that aren't yet in the store. Read-only dry-run of
+    catch-up — hits EDGAR's index (needs a real contact email), ingests nothing."""
+    _configure_logging()
+    # Heavy `edgar` imports deferred so --help / config-error paths stay fast.
+    from datetime import date
+
+    from fintin.adapters.edgar.client import (
+        EdgarClient,
+        EdgarConfigError,
+        EdgarThrottleError,
+    )
+    from fintin.adapters.edgar.filings_index import fetch_work_candidates
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.adapters.store.raw_fact_repo import high_water_mark, present_accessions
+    from fintin.core.reconcile import compute_work_list, resolve_window
+    from fintin.core.universe import resolve_universe
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    if cfg.universe is None:
+        typer.secho(
+            f"Config error: no [universe] section in {config} — define the Universe first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Discovery hits EDGAR's index — build the rate-limited client (its gate
+    # rejects a blank/placeholder email before any request; ban-safety, FR-1).
+    try:
+        edgar_client = EdgarClient(cfg)
+    except EdgarConfigError as exc:
+        typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Universe resolution is offline (Story 2.1) — an empty resolved Universe is a
+    # hard misconfiguration for a screening scope.
+    resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    if not resolved.ciks:
+        typer.secho(
+            "Resolved Universe is empty — check the [universe] tickers/ciks.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # HWM sizes the index scan window (a hint, AD-16) — never the done-ness test.
+        hwm = high_water_mark(client)
+        window_start, window_end = resolve_window(
+            hwm, cfg.reconcile.lookback_days, date.today()
+        )
+        # Discover candidates from EDGAR's index, THEN check membership by their
+        # exact accessions (AD-16 authority — decoupled from any date).
+        candidates = fetch_work_candidates(
+            edgar_client,
+            filing_date=f"{window_start.isoformat()}:{window_end.isoformat()}",
+            ciks=resolved.ciks,
+        )
+        present = present_accessions(
+            client, accessions={c.accession for c in candidates}
+        )
+        work = compute_work_list(candidates, present)
+    except EdgarThrottleError as exc:
+        typer.secho(f"EDGAR throttled, gave up: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:  # discovery/query error (connection already verified)
+        typer.secho(f"Work-list failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    n = len(work.items)
+    companies = len({item.cik for item in work.items})
+    typer.secho(
+        f"Work list over {window_start.isoformat()}..{window_end.isoformat()} "
+        f"({cfg.reconcile.lookback_days}-day lookback): "
+        f"{n} outstanding filing(s) across {companies} company(ies) "
+        f"[{work.scanned} scanned, {work.already_present} already present].",
+        fg=typer.colors.GREEN,
+    )
+    if hwm is None:
+        typer.secho(
+            "Store is empty — this shows only the recent lookback window; "
+            "run a full backfill for complete history.",
+            fg=typer.colors.YELLOW,
+        )
+    if show_items:
+        for item in work.items:
+            typer.echo(
+                f"  {item.accession}  {item.cik}  {item.form}  {item.filed_date.isoformat()}"
+            )
+
+
 def main() -> None:
     app()
 

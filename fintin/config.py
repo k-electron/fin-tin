@@ -72,12 +72,33 @@ class UniverseConfig:
 # CIK is a UInt32 in the store (AD "Identity" convention), so 1..2^32-1.
 _CIK_MAX = 4_294_967_295
 
+# Default reordering-safe lookback window (AD-16) — days before the store's
+# high-water mark to re-scan for stragglers/restatements. Tunable via config.
+DEFAULT_LOOKBACK_DAYS = 7
+# Upper bound — a lookback is a filing-order-skew window, not a backfill horizon.
+# Caps quarterly-index fan-out and guards against a timedelta OverflowError.
+MAX_LOOKBACK_DAYS = 3650  # ~10 years
+
+
+@dataclass(frozen=True)
+class ReconcileConfig:
+    """Work-list reconciler tuning (AD-16). ``lookback_days`` sizes the
+    reordering-safe scan window `[HWM - lookback, today]` — spanning the
+    plausible filing-order skew so a filing filed just before the high-water
+    mark but not yet committed is still re-checked. The Universe/rate/identity
+    live in their own sections; this is derivation tuning only."""
+
+    lookback_days: int = DEFAULT_LOOKBACK_DAYS
+
 
 @dataclass(frozen=True)
 class Config:
     clickhouse: ClickHouseConfig
     edgar: EdgarConfig | None = None
     universe: UniverseConfig | None = None
+    # Always populated (default when the [reconcile] section is absent) so the
+    # reconciler always has a lookback value.
+    reconcile: ReconcileConfig = ReconcileConfig()
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
@@ -120,8 +141,18 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             raise ConfigError(f"[universe] in {path} must be a table/section.")
         universe = _parse_universe(un, path)
 
+    rc = data.get("reconcile")
+    reconcile = ReconcileConfig()
+    if rc is not None:
+        if not isinstance(rc, dict):
+            raise ConfigError(f"[reconcile] in {path} must be a table/section.")
+        reconcile = _parse_reconcile(rc, path)
+
     return Config(
-        clickhouse=_parse_clickhouse(ch, path), edgar=edgar, universe=universe
+        clickhouse=_parse_clickhouse(ch, path),
+        edgar=edgar,
+        universe=universe,
+        reconcile=reconcile,
     )
 
 
@@ -268,3 +299,19 @@ def _parse_universe(un: dict, path: Path) -> UniverseConfig:
         )
 
     return UniverseConfig(tickers=tuple(tickers), ciks=tuple(ciks))
+
+
+def _parse_reconcile(rc: dict, path: Path) -> ReconcileConfig:
+    lookback = rc.get("lookback_days", DEFAULT_LOOKBACK_DAYS)
+    # bool subclasses int — reject it before the int/range check.
+    if isinstance(lookback, bool) or not isinstance(lookback, int):
+        raise ConfigError(
+            f"[reconcile].lookback_days in {path} must be an integer, got {lookback!r}."
+        )
+    if not (1 <= lookback <= MAX_LOOKBACK_DAYS):
+        raise ConfigError(
+            f"[reconcile].lookback_days in {path} must be between 1 and "
+            f"{MAX_LOOKBACK_DAYS} (a lookback is a filing-skew window, not a "
+            f"backfill horizon), got {lookback}."
+        )
+    return ReconcileConfig(lookback_days=lookback)

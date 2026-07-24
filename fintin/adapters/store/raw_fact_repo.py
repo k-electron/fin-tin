@@ -5,7 +5,8 @@ ClickHouse access; no DDL here (Story 1.2 owns the schema, AD-18). Insert-only
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
+from datetime import date
 
 from fintin.core.ingest import RawFactRow
 
@@ -61,3 +62,33 @@ def read_raw_facts(client, cik: int) -> list[RawFactRow]:
         parameters={"cik": int(cik)},
     )
     return [RawFactRow(*row) for row in result.result_rows]
+
+
+def high_water_mark(client) -> date | None:
+    """The greatest ``filed_date`` in ``raw_fact`` (``None`` on an empty store).
+    A **scan-sizing hint only** (AD-16) — it bounds how far back the reconciler
+    scans, never what counts as done. Guarded by ``count()`` because ClickHouse
+    ``max()`` on an empty table returns the Date zero (1970-01-01), not NULL."""
+    rows = client.query("SELECT count(), max(filed_date) FROM raw_fact").result_rows
+    if not rows or rows[0][0] == 0:
+        return None
+    return rows[0][1]
+
+
+def present_accessions(client, *, accessions: Collection[str]) -> set[str]:
+    """Of the given ``accessions``, the subset already present in ``raw_fact`` — the
+    AD-16 membership check, by **exact accession** (the correctness authority). Not
+    windowed by any date: the scan window sizes the EDGAR *index* fetch, never the
+    store membership (a candidate's index ``filing_date`` and its stored
+    ``filed_date`` come from different SEC sources and could disagree). Parameterized
+    (never string-interpolated). ``accession`` is ``raw_fact``'s leading sort key, so
+    the ``IN`` lookup is an efficient primary-key scan. Empty input → ``set()`` with
+    no query. No ``FINAL``: membership is existence, and dedup rows share an accession."""
+    acc_list = [str(a) for a in accessions]
+    if not acc_list:
+        return set()
+    result = client.query(
+        "SELECT DISTINCT accession FROM raw_fact WHERE accession IN %(accessions)s",
+        parameters={"accessions": acc_list},
+    )
+    return {row[0] for row in result.result_rows}

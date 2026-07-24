@@ -44,3 +44,10 @@ tickers = [
 ciks = [
     1652044,   # Alphabet — example of a direct CIK entry (skips ticker resolution)
 ]
+
+[reconcile]
+# Work-list tuning (optional; omit to use the default). lookback_days sizes the
+# reordering-safe scan window [high-water-mark - lookback, today] that
+# `fintin work-list` (and, later, catch-up) re-scans EDGAR's index over — wide
+# enough to catch stragglers/restatements filed just before the high-water mark.
+lookback_days = 7

@@ -17,8 +17,10 @@ from edgar.entity.models import FinancialFact
 from fintin.adapters.store import schema as store_schema
 from fintin.adapters.store.client import get_client
 from fintin.adapters.store.raw_fact_repo import (
+    high_water_mark,
     insert_raw_facts,
     next_ingest_version,
+    present_accessions,
 )
 from fintin.core.ingest import RawFactRow, to_raw_fact_rows
 
@@ -48,10 +50,19 @@ def schema_client(local_clickhouse_config):
             cleanup.close()
 
 
-def _row(*, raw_tag="us-gaap:Revenues", value=1000.0, version=1, content_hash="h1") -> RawFactRow:
+def _row(
+    *,
+    raw_tag="us-gaap:Revenues",
+    value=1000.0,
+    version=1,
+    content_hash="h1",
+    cik=320193,
+    accession="0000320193-24-000123",
+    filed_date=date(2024, 2, 1),
+) -> RawFactRow:
     return RawFactRow(
-        cik=320193,
-        accession="0000320193-24-000123",
+        cik=cik,
+        accession=accession,
         raw_tag=raw_tag,
         raw_label="Revenues",
         taxonomy="us-gaap",
@@ -60,7 +71,7 @@ def _row(*, raw_tag="us-gaap:Revenues", value=1000.0, version=1, content_hash="h
         unit="USD",
         value=value,
         form="10-K",
-        filed_date=date(2024, 2, 1),
+        filed_date=filed_date,
         content_hash=content_hash,
         taxonomy_version="5.43.0",
         version=version,
@@ -174,3 +185,47 @@ def test_transform_to_insert_roundtrip(schema_client):
     assert revenues[0] == "us-gaap:Revenues" and revenues[1] == 123456.0  # actual, unscaled
     assert revenues[2] == date(2023, 1, 1) and revenues[3] == date(2023, 12, 31)  # duration
     assert revenues[5] == version
+
+
+# --- work-list membership + HWM (Story 2.2) ------------------------------------
+
+
+@pytest.mark.integration
+def test_high_water_mark_none_on_empty(schema_client):
+    assert high_water_mark(schema_client) is None  # empty store -> None (not 1970)
+
+
+@pytest.mark.integration
+def test_high_water_mark_returns_latest_filed_date(schema_client):
+    insert_raw_facts(
+        schema_client,
+        [
+            _row(accession="0000000001-24-000001", filed_date=date(2024, 2, 1), content_hash="a"),
+            _row(accession="0000000001-24-000002", filed_date=date(2024, 5, 15), content_hash="b"),
+        ],
+    )
+    assert high_water_mark(schema_client) == date(2024, 5, 15)
+
+
+@pytest.mark.integration
+def test_present_accessions_returns_present_subset(schema_client):
+    # Membership by EXACT accession (AD-16), independent of cik/filed_date.
+    insert_raw_facts(
+        schema_client,
+        [
+            _row(accession="0000320193-24-000001", filed_date=date(2024, 5, 1), content_hash="a"),
+            _row(accession="0000320193-23-000009", filed_date=date(2023, 1, 1), content_hash="b"),
+        ],
+    )
+    # Query a candidate set: two present, one absent.
+    present = present_accessions(
+        schema_client,
+        accessions={"0000320193-24-000001", "0000320193-23-000009", "0000999999-24-000000"},
+    )
+    assert present == {"0000320193-24-000001", "0000320193-23-000009"}  # absent one excluded
+
+
+@pytest.mark.integration
+def test_present_accessions_empty_is_empty_no_query(schema_client):
+    insert_raw_facts(schema_client, [_row(content_hash="a")])
+    assert present_accessions(schema_client, accessions=[]) == set()

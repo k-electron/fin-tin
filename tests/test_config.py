@@ -6,7 +6,13 @@ import textwrap
 
 import pytest
 
-from fintin.config import ConfigError, EdgarConfig, UniverseConfig, load_config
+from fintin.config import (
+    DEFAULT_LOOKBACK_DAYS,
+    ConfigError,
+    EdgarConfig,
+    UniverseConfig,
+    load_config,
+)
 
 _VALID = textwrap.dedent(
     """
@@ -247,6 +253,41 @@ def test_universe_pure_tickers_parse(tmp_path):
     ],
 )
 def test_universe_structural_validation_rejects(tmp_path, block):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + "\n" + textwrap.dedent(block))
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
+# --- [reconcile] block (Story 2.2) ---------------------------------------------
+
+
+def test_reconcile_absent_uses_default(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID)
+    cfg = load_config(p)
+    assert cfg.reconcile.lookback_days == DEFAULT_LOOKBACK_DAYS
+
+
+def test_reconcile_lookback_parsed(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + "\n[reconcile]\nlookback_days = 30\n")
+    assert load_config(p).reconcile.lookback_days == 30
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "[reconcile]\nlookback_days = 0\n",  # below minimum
+        "[reconcile]\nlookback_days = -1\n",  # negative
+        "[reconcile]\nlookback_days = true\n",  # bool masquerading as int
+        '[reconcile]\nlookback_days = "7"\n',  # not an int
+        "[reconcile]\nlookback_days = 1.5\n",  # float
+        "[reconcile]\nlookback_days = 3651\n",  # above the 10-year cap
+        "[reconcile]\nlookback_days = 100000000000\n",  # absurd (would overflow timedelta)
+    ],
+)
+def test_reconcile_validation_rejects(tmp_path, block):
     p = tmp_path / "fintin.toml"
     p.write_text(_VALID + "\n" + textwrap.dedent(block))
     with pytest.raises(ConfigError):
