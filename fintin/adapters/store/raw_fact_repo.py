@@ -47,3 +47,17 @@ def next_ingest_version(client) -> int:
     rows = client.query("SELECT max(version) FROM raw_fact").result_rows
     current = rows[0][0] if rows and rows[0][0] is not None else 0
     return int(current) + 1
+
+
+def read_raw_facts(client, cik: int) -> list[RawFactRow]:
+    """Read one company's Tier 0 rows (deduplicated on read via ``FINAL``, AD-6)
+    as :class:`RawFactRow` tuples — the input to the Tier 0 → Tier 1 mapping
+    (derivation is one-way, AD-4). Parameterized on ``cik`` (never
+    string-interpolated). The SELECT enumerates ``RAW_FACT_COLUMNS`` in
+    ``RawFactRow`` field order so ``RawFactRow(*row)`` is positionally correct."""
+    cols = ", ".join(RAW_FACT_COLUMNS)
+    result = client.query(
+        f"SELECT {cols} FROM raw_fact FINAL WHERE cik = %(cik)s",
+        parameters={"cik": int(cik)},
+    )
+    return [RawFactRow(*row) for row in result.result_rows]

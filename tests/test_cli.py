@@ -95,3 +95,24 @@ def test_ingest_company_invalid_cik_reports_clean_error():
     assert result.exit_code == 2
     assert "Invalid CIK" in result.output
     assert "Traceback" not in result.output
+
+
+def test_help_lists_map_canonical():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "map-canonical" in result.output
+
+
+def test_map_canonical_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["map-canonical", "320193", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_map_canonical_invalid_cik_reports_clean_error():
+    # Must fail fast on an out-of-range CIK before touching ClickHouse.
+    result = runner.invoke(app, ["map-canonical", "0"])
+    assert result.exit_code == 2
+    assert "Invalid CIK" in result.output
+    assert "Traceback" not in result.output

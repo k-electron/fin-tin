@@ -34,6 +34,34 @@ uv run fintin check-connection
 the project's virtual environment; invoke it via `uv run fintin ...` unless you
 have activated `.venv`.)
 
+## Pipeline
+
+Data is derived one way — EDGAR → **Tier 0** (raw) → **Tier 1** (canonical) →
+resolution → **wide screening mart**:
+
+```bash
+# 1. Create the store schema (idempotent; also refreshes the mart view)
+uv run fintin schema-init
+
+# 2. Land one company's raw facts into Tier 0 (hits EDGAR — needs a real
+#    contact_email in fintin.toml; rate-limited & fair-access compliant)
+uv run fintin ingest-company 320193
+
+# 3. Map Tier 0 → canonical Tier 1 via edgartools' standardization taxonomy.
+#    OFFLINE — issues zero EDGAR requests, so it needs no contact email.
+uv run fintin map-canonical 320193
+```
+
+Unmappable raw tags stay in Tier 0 only (they have no cross-company canonical);
+that is expected. Re-running either command is idempotent on read (a higher
+ingest-monotonic `version` supersedes; readers use `FINAL`). After mapping, the
+`screening_mart` view exposes one row per `(cik, period)` with canonical concepts
+(`revenues`, `net_income`, `assets`, `liabilities`) as columns.
+
+> **Note:** `schema-init` is create-only for tables, but the `screening_mart` view
+> is `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up mart
+> changes on an existing database.
+
 ## Configuration
 
 All configuration lives in a single `fintin.toml`. **This repo is public, so

@@ -101,7 +101,11 @@ GROUP BY cik, canonical_concept, unit, period_start, period_end
 """
 
 # Wide screening mart (AD-8) — one row per (cik, period_start, period_end), concepts as columns.
-# Curated starter set of edgartools standardized labels; extend as the mapping (Story 1.5) lands.
+# Filter labels are the ACTUAL edgartools standardized concept ids emitted by the
+# Story 1.5 mapping (`get_standard_concept`): 'Revenue' (not 'Revenues') and
+# 'NetIncome' (not 'NetIncomeLoss'); 'Assets'/'Liabilities' are verbatim. The SQL
+# column aliases (revenues, net_income, ...) are the stable query surface. Extend
+# as more canonical concepts are curated onto the mart.
 # Each column: NULL when the concept is absent for the (cik, period) — distinct from a real 0.0;
 # monetary concepts are pinned to unit='USD' (v1 is us-gaap USD-only) so no unit collapses silently.
 SCREENING_MART = """
@@ -110,10 +114,10 @@ SELECT
     cik,
     period_start,
     period_end,
-    if(countIf(canonical_concept = 'Revenues'      AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Revenues'      AND unit = 'USD'), NULL) AS revenues,
-    if(countIf(canonical_concept = 'NetIncomeLoss'  AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'NetIncomeLoss'  AND unit = 'USD'), NULL) AS net_income,
-    if(countIf(canonical_concept = 'Assets'         AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Assets'         AND unit = 'USD'), NULL) AS assets,
-    if(countIf(canonical_concept = 'Liabilities'    AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Liabilities'    AND unit = 'USD'), NULL) AS liabilities
+    if(countIf(canonical_concept = 'Revenue'      AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Revenue'      AND unit = 'USD'), NULL) AS revenues,
+    if(countIf(canonical_concept = 'NetIncome'    AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'NetIncome'    AND unit = 'USD'), NULL) AS net_income,
+    if(countIf(canonical_concept = 'Assets'       AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Assets'       AND unit = 'USD'), NULL) AS assets,
+    if(countIf(canonical_concept = 'Liabilities'  AND unit = 'USD') > 0, argMaxMergeIf(value_state, canonical_concept = 'Liabilities'  AND unit = 'USD'), NULL) AS liabilities
 FROM resolved_fact
 GROUP BY cik, period_start, period_end
 """

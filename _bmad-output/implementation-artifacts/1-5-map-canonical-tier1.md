@@ -1,6 +1,9 @@
+---
+baseline_commit: f411adb111726141df6683909689b43de98ab2f4
+---
 # Story 1.5: Map raw facts to canonical Tier 1
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -18,44 +21,44 @@ so that facts become cross-company comparable.
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Offline standardization adapter** (AC: 1, 2) — `fintin/adapters/edgar/standardize.py` (NEW)
-  - [ ] `standardize_concept(raw_tag: str) -> str | None`: strip the namespace prefix (`us-gaap:` / `dei:` / `srt:` → local name) then return `edgar.xbrl.standardization.reverse_index.get_standard_concept(local_name)`. Returns `None` for unmappable **or** excluded tags — this is the AC-2 "no canonical row" signal.
-  - [ ] `taxonomy_version() -> str`: return `edgar.__version__` (`"5.43.0"`) — the AD-9/AD-14 taxonomy_version. (Self-contained; do NOT import from `facts.py`/`client.py` so the map path never drags in the rate-limited client.)
-  - [ ] This module imports `edgar` but MUST NOT construct `EdgarClient`, call `edgar.set_identity`, or call any fetch (`get_company_facts`, `get_filings`, …). It is the second `edgar` importer (alongside `client.py`/`facts.py`) but a **pure-offline** one.
-- [ ] **Task 2 — Pure core mapping transform** (AC: 1, 2) — `fintin/core/canonical.py` (NEW)
-  - [ ] `CanonicalFactRow` NamedTuple in **exact `canonical_fact` column order**: `cik, accession, raw_tag, canonical_concept, raw_label, period_start, period_end, unit, value, form, filed_date, content_hash, taxonomy_version, version`.
-  - [ ] `MapResult` NamedTuple: `cik, raw_seen, mapped, unmapped, version` (+ a `.dropped`-style clarity property if useful).
-  - [ ] `to_canonical_fact_rows(raw_rows, *, cik, standardize, taxonomy_version, version) -> (list[CanonicalFactRow], MapResult)`: for each `RawFactRow`, look up `canonical_concept = standardize(row.raw_tag)`; if `None`, count `unmapped` and emit nothing; else emit a `CanonicalFactRow` **carrying over** `content_hash` from the Tier 0 row (AD-5 attribute / AD-14 provenance), preserving identity fields verbatim, stamping the supplied `taxonomy_version` and `version`.
-  - [ ] **DISASTER GUARD — construct by NAMED field, never positionally.** `RawFactRow` has `taxonomy` at index 4; `CanonicalFactRow` has `canonical_concept` at index 3 and NO `taxonomy`. A positional copy would silently write the raw taxonomy into `canonical_concept` and shift every later column. Build `CanonicalFactRow(cik=r.cik, accession=r.accession, raw_tag=r.raw_tag, canonical_concept=concept, raw_label=r.raw_label, …)` explicitly by keyword; drop `taxonomy`.
-  - [ ] `standardize` is an injected **port** (`Callable[[str], str | None]`) — `core` imports NO `edgar`. Add the AD-3-style AST import guard test.
-  - [ ] No intra-batch dedup: `raw_rows` come from `raw_fact FINAL` (already unique by identity key), and `raw_tag` stays in the Tier 1 key, so each Tier 0 row maps 1:1 to at most one Tier 1 row. (Two different raw tags that map to the *same* canonical concept keep DISTINCT identity keys — resolving those is Story 1.6's latest-filed-wins job, not this story's.)
-- [ ] **Task 3 — Store: read Tier 0, write Tier 1** (AC: 1, 3)
-  - [ ] `fintin/adapters/store/raw_fact_repo.py` (UPDATE): add `read_raw_facts(client, cik) -> list[RawFactRow]` — `SELECT <cols> FROM raw_fact FINAL WHERE cik = %(cik)s`, parameterized (never string-interpolate the CIK), returning `RawFactRow` tuples (Tier 0 → Tier 1 derivation is one-way, AD-4). **The SELECT column list MUST enumerate `RAW_FACT_COLUMNS` in `RawFactRow` field order** (don't rely on `SELECT *` ordering) so `RawFactRow(*row)` is correct; assert this with a round-trip test.
-  - [ ] `fintin/adapters/store/canonical_fact_repo.py` (NEW): `CANONICAL_FACT_COLUMNS` (schema order); `insert_canonical_facts(client, rows) -> int` (empty = no-op); `next_canonical_version(client) -> int` = `max(version)+1` over `canonical_fact` (1 if empty) — Tier 1's own ingest-monotonic sequence (AD-6), independent of Tier 0's.
-- [ ] **Task 4 — Core orchestrator** (AC: 1, 2, 3) — `fintin/core/canonical.py`
-  - [ ] `map_company(cik, *, read_raw_facts, standardize, insert_rows, taxonomy_version, version) -> MapResult`: `read_raw_facts(cik)` → `to_canonical_fact_rows(...)` → `insert_rows(rows)`; return the `MapResult`. Injected ports only (no adapter imports in `core`).
-- [ ] **Task 5 — CLI trigger** (AC: 1, 2, 3) — `fintin/cli/app.py` (UPDATE): `map-canonical CIK`
-  - [ ] Lazy-import the edgar/standardize/core/store modules (keep `--help`/`check-connection`/`schema-init` fast).
-  - [ ] Validate `1 <= cik <= 4_294_967_295` (exit 2) before any work — mirror `ingest-company`.
-  - [ ] **No `EdgarClient`, no contact-email gate** — mapping is zero-network (AC-1), so it must run even with a placeholder email. This is the structural embodiment of "zero EDGAR requests".
-  - [ ] `check_connection` (surface CH problems), `get_client`, `version = next_canonical_version(client)`, then `map_company(...)`.
-  - [ ] If `result.raw_seen == 0`: emit a clear yellow message ("no Tier 0 facts for CIK N — run `ingest-company N` first") and exit 1 (the analog of `NoCompanyFactsError`).
-  - [ ] Success line: `Mapped CIK N: {mapped} canonical facts from {raw_seen} Tier 0 facts ({unmapped} tags unmappable, kept in Tier 0 only).`
-  - [ ] `close()` the client in `finally`.
-- [ ] **Task 6 — Reconcile screening_mart labels to real edgartools output** (supporting; unblocks AC-1 end-to-end + Story 1.6) — `fintin/adapters/store/schema.py` (UPDATE)
-  - [ ] The mart's canonical-label filters were provisional guesses in Story 1.2 (`schema.py:104` "extend as the mapping (Story 1.5) lands"). Empirically, `get_standard_concept` emits `Revenue` (not `Revenues`) and `NetIncome` (not `NetIncomeLoss`); `Assets`/`Liabilities` already match. Change the two mismatched **filter labels** in `SCREENING_MART`: `'Revenues' → 'Revenue'`, `'NetIncomeLoss' → 'NetIncome'`. Keep the SQL **column aliases** (`revenues`, `net_income`, `assets`, `liabilities`) unchanged so downstream queries are unaffected.
-  - [ ] `SCREENING_MART` is `CREATE OR REPLACE VIEW`, so `schema-init` re-applies it live (no migration needed). Update the accompanying comment. AD-18: this is the store adapter, the sole DDL owner — compliant.
-  - [ ] **REGRESSION — update Story 1.2's mart tests in lockstep.** `tests/test_schema.py` inserts synthetic `canonical_fact` rows whose `canonical_concept` literal (the 4th VALUES field) is `'Revenues'` and asserts the mart `revenues` column (lines ~117, 152, 171, 190). Changing the mart filter to `'Revenue'` makes those rows stop matching → tests fail. Fix: change only the `canonical_concept` literal `'Revenues' → 'Revenue'` in those synthetic inserts (leave `raw_tag`/`raw_label` as `'us-gaap:Revenues'`/`'Revenues'`). The `net_income` column is only ever asserted `None` (no NetIncome row is inserted), so the `NetIncomeLoss → NetIncome` filter change needs no test data change. Run `test_schema.py` green after.
-- [ ] **Task 7 — Tests (never hit live EDGAR; NFR-7)**
-  - [ ] `tests/test_canonical.py` (pure/offline): map/unmap/None-drop; provenance carry-over (content_hash carried, taxonomy_version + version stamped, identity preserved); two-tags→same-concept keeps two rows; `map_company` wiring; AST import guard (no `edgar` in `core/canonical.py`).
-  - [ ] `tests/test_standardize.py` (offline, real edgartools mapping): `standardize_concept('us-gaap:Assets') == 'Assets'`, `('us-gaap:Revenues') == 'Revenue'`, `('us-gaap:NetIncomeLoss') == 'NetIncome'`, `('us-gaap:ZzzFakeConceptXyz') is None`, prefix-strip parity (`'Assets'` == `'us-gaap:Assets'`); **`test_standardize_is_offline`**: block `socket.socket.connect`/`socket.create_connection` and assert a lookup still succeeds (proves AC-1 zero-network); `taxonomy_version() == edgar.__version__`.
-  - [ ] `tests/test_canonical_fact_repo.py` (integration, throwaway DB): `read_raw_facts` round-trip; `insert_canonical_facts` + FINAL read-back; `next_canonical_version` monotonic; **re-map idempotency-on-read** (insert v1 then v2 same identity, corrected value → FINAL count unchanged, higher `version`/value wins, holds after `OPTIMIZE … FINAL`) = AC-3; **end-to-end mart seam**: land raw `Revenues`+`Assets` facts → `read_raw_facts` → map (real standardizer) → `insert_canonical_facts` → assert `screening_mart` `revenues`/`assets` columns are populated (proves Task 6 + MV auto-populate).
-  - [ ] `tests/test_cli.py` (UPDATE): `--help` lists `map-canonical`; invalid CIK → exit 2; missing config → clean error (exit 2, no traceback); (integration) empty-Tier-0 CIK → yellow "ingest first", exit 1.
-- [ ] **Task 8 — Validate & document**
-  - [ ] `uv run pytest` green (unit + integration with local ClickHouse up).
-  - [ ] Update `README.md`: add the `map-canonical CIK` step to the pipeline flow (`ingest-company` → `map-canonical`), noting it is offline and needs no EDGAR email.
-  - [ ] Append any deferrals to `_bmad-output/implementation-artifacts/deferred-work.md`.
-  - [ ] Fill Dev Agent Record + File List; set Status appropriately.
+- [x] **Task 1 — Offline standardization adapter** (AC: 1, 2) — `fintin/adapters/edgar/standardize.py` (NEW)
+  - [x] `standardize_concept(raw_tag: str) -> str | None`: strip the namespace prefix (`us-gaap:` / `dei:` / `srt:` → local name) then return `edgar.xbrl.standardization.reverse_index.get_standard_concept(local_name)`. Returns `None` for unmappable **or** excluded tags — this is the AC-2 "no canonical row" signal.
+  - [x] `taxonomy_version() -> str`: return `edgar.__version__` (`"5.43.0"`) — the AD-9/AD-14 taxonomy_version. (Self-contained; do NOT import from `facts.py`/`client.py` so the map path never drags in the rate-limited client.)
+  - [x] This module imports `edgar` but MUST NOT construct `EdgarClient`, call `edgar.set_identity`, or call any fetch (`get_company_facts`, `get_filings`, …). It is the second `edgar` importer (alongside `client.py`/`facts.py`) but a **pure-offline** one.
+- [x] **Task 2 — Pure core mapping transform** (AC: 1, 2) — `fintin/core/canonical.py` (NEW)
+  - [x] `CanonicalFactRow` NamedTuple in **exact `canonical_fact` column order**: `cik, accession, raw_tag, canonical_concept, raw_label, period_start, period_end, unit, value, form, filed_date, content_hash, taxonomy_version, version`.
+  - [x] `MapResult` NamedTuple: `cik, raw_seen, mapped, unmapped, version` (+ a `.dropped`-style clarity property if useful).
+  - [x] `to_canonical_fact_rows(raw_rows, *, cik, standardize, taxonomy_version, version) -> (list[CanonicalFactRow], MapResult)`: for each `RawFactRow`, look up `canonical_concept = standardize(row.raw_tag)`; if `None`, count `unmapped` and emit nothing; else emit a `CanonicalFactRow` **carrying over** `content_hash` from the Tier 0 row (AD-5 attribute / AD-14 provenance), preserving identity fields verbatim, stamping the supplied `taxonomy_version` and `version`.
+  - [x] **DISASTER GUARD — construct by NAMED field, never positionally.** `RawFactRow` has `taxonomy` at index 4; `CanonicalFactRow` has `canonical_concept` at index 3 and NO `taxonomy`. A positional copy would silently write the raw taxonomy into `canonical_concept` and shift every later column. Build `CanonicalFactRow(cik=r.cik, accession=r.accession, raw_tag=r.raw_tag, canonical_concept=concept, raw_label=r.raw_label, …)` explicitly by keyword; drop `taxonomy`.
+  - [x] `standardize` is an injected **port** (`Callable[[str], str | None]`) — `core` imports NO `edgar`. Add the AD-3-style AST import guard test.
+  - [x] No intra-batch dedup: `raw_rows` come from `raw_fact FINAL` (already unique by identity key), and `raw_tag` stays in the Tier 1 key, so each Tier 0 row maps 1:1 to at most one Tier 1 row. (Two different raw tags that map to the *same* canonical concept keep DISTINCT identity keys — resolving those is Story 1.6's latest-filed-wins job, not this story's.)
+- [x] **Task 3 — Store: read Tier 0, write Tier 1** (AC: 1, 3)
+  - [x] `fintin/adapters/store/raw_fact_repo.py` (UPDATE): add `read_raw_facts(client, cik) -> list[RawFactRow]` — `SELECT <cols> FROM raw_fact FINAL WHERE cik = %(cik)s`, parameterized (never string-interpolate the CIK), returning `RawFactRow` tuples (Tier 0 → Tier 1 derivation is one-way, AD-4). **The SELECT column list MUST enumerate `RAW_FACT_COLUMNS` in `RawFactRow` field order** (don't rely on `SELECT *` ordering) so `RawFactRow(*row)` is correct; assert this with a round-trip test.
+  - [x] `fintin/adapters/store/canonical_fact_repo.py` (NEW): `CANONICAL_FACT_COLUMNS` (schema order); `insert_canonical_facts(client, rows) -> int` (empty = no-op); `next_canonical_version(client) -> int` = `max(version)+1` over `canonical_fact` (1 if empty) — Tier 1's own ingest-monotonic sequence (AD-6), independent of Tier 0's.
+- [x] **Task 4 — Core orchestrator** (AC: 1, 2, 3) — `fintin/core/canonical.py`
+  - [x] `map_company(cik, *, read_raw_facts, standardize, insert_rows, taxonomy_version, version) -> MapResult`: `read_raw_facts(cik)` → `to_canonical_fact_rows(...)` → `insert_rows(rows)`; return the `MapResult`. Injected ports only (no adapter imports in `core`).
+- [x] **Task 5 — CLI trigger** (AC: 1, 2, 3) — `fintin/cli/app.py` (UPDATE): `map-canonical CIK`
+  - [x] Lazy-import the edgar/standardize/core/store modules (keep `--help`/`check-connection`/`schema-init` fast).
+  - [x] Validate `1 <= cik <= 4_294_967_295` (exit 2) before any work — mirror `ingest-company`.
+  - [x] **No `EdgarClient`, no contact-email gate** — mapping is zero-network (AC-1), so it must run even with a placeholder email. This is the structural embodiment of "zero EDGAR requests".
+  - [x] `check_connection` (surface CH problems), `get_client`, `version = next_canonical_version(client)`, then `map_company(...)`.
+  - [x] If `result.raw_seen == 0`: emit a clear yellow message ("no Tier 0 facts for CIK N — run `ingest-company N` first") and exit 1 (the analog of `NoCompanyFactsError`).
+  - [x] Success line: `Mapped CIK N: {mapped} canonical facts from {raw_seen} Tier 0 facts ({unmapped} tags unmappable, kept in Tier 0 only).`
+  - [x] `close()` the client in `finally`.
+- [x] **Task 6 — Reconcile screening_mart labels to real edgartools output** (supporting; unblocks AC-1 end-to-end + Story 1.6) — `fintin/adapters/store/schema.py` (UPDATE)
+  - [x] The mart's canonical-label filters were provisional guesses in Story 1.2 (`schema.py:104` "extend as the mapping (Story 1.5) lands"). Empirically, `get_standard_concept` emits `Revenue` (not `Revenues`) and `NetIncome` (not `NetIncomeLoss`); `Assets`/`Liabilities` already match. Change the two mismatched **filter labels** in `SCREENING_MART`: `'Revenues' → 'Revenue'`, `'NetIncomeLoss' → 'NetIncome'`. Keep the SQL **column aliases** (`revenues`, `net_income`, `assets`, `liabilities`) unchanged so downstream queries are unaffected.
+  - [x] `SCREENING_MART` is `CREATE OR REPLACE VIEW`, so `schema-init` re-applies it live (no migration needed). Update the accompanying comment. AD-18: this is the store adapter, the sole DDL owner — compliant.
+  - [x] **REGRESSION — update Story 1.2's mart tests in lockstep.** `tests/test_schema.py` inserts synthetic `canonical_fact` rows whose `canonical_concept` literal (the 4th VALUES field) is `'Revenues'` and asserts the mart `revenues` column (lines ~117, 152, 171, 190). Changing the mart filter to `'Revenue'` makes those rows stop matching → tests fail. Fix: change only the `canonical_concept` literal `'Revenues' → 'Revenue'` in those synthetic inserts (leave `raw_tag`/`raw_label` as `'us-gaap:Revenues'`/`'Revenues'`). The `net_income` column is only ever asserted `None` (no NetIncome row is inserted), so the `NetIncomeLoss → NetIncome` filter change needs no test data change. Run `test_schema.py` green after.
+- [x] **Task 7 — Tests (never hit live EDGAR; NFR-7)**
+  - [x] `tests/test_canonical.py` (pure/offline): map/unmap/None-drop; provenance carry-over (content_hash carried, taxonomy_version + version stamped, identity preserved); two-tags→same-concept keeps two rows; `map_company` wiring; AST import guard (no `edgar` in `core/canonical.py`).
+  - [x] `tests/test_standardize.py` (offline, real edgartools mapping): `standardize_concept('us-gaap:Assets') == 'Assets'`, `('us-gaap:Revenues') == 'Revenue'`, `('us-gaap:NetIncomeLoss') == 'NetIncome'`, `('us-gaap:ZzzFakeConceptXyz') is None`, prefix-strip parity (`'Assets'` == `'us-gaap:Assets'`); **`test_standardize_is_offline`**: block `socket.socket.connect`/`socket.create_connection` and assert a lookup still succeeds (proves AC-1 zero-network); `taxonomy_version() == edgar.__version__`.
+  - [x] `tests/test_canonical_fact_repo.py` (integration, throwaway DB): `read_raw_facts` round-trip; `insert_canonical_facts` + FINAL read-back; `next_canonical_version` monotonic; **re-map idempotency-on-read** (insert v1 then v2 same identity, corrected value → FINAL count unchanged, higher `version`/value wins, holds after `OPTIMIZE … FINAL`) = AC-3; **end-to-end mart seam**: land raw `Revenues`+`Assets` facts → `read_raw_facts` → map (real standardizer) → `insert_canonical_facts` → assert `screening_mart` `revenues`/`assets` columns are populated (proves Task 6 + MV auto-populate).
+  - [x] `tests/test_cli.py` (UPDATE): `--help` lists `map-canonical`; invalid CIK → exit 2; missing config → clean error (exit 2, no traceback); (integration) empty-Tier-0 CIK → yellow "ingest first", exit 1.
+- [x] **Task 8 — Validate & document**
+  - [x] `uv run pytest` green (unit + integration with local ClickHouse up).
+  - [x] Update `README.md`: add the `map-canonical CIK` step to the pipeline flow (`ingest-company` → `map-canonical`), noting it is offline and needs no EDGAR email.
+  - [x] Append any deferrals to `_bmad-output/implementation-artifacts/deferred-work.md`.
+  - [x] Fill Dev Agent Record + File List; set Status appropriately.
 
 ## Dev Notes
 
@@ -121,8 +124,36 @@ so that facts become cross-company comparable.
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Opus 4.8, 1M context)
+
 ### Debug Log References
+
+- Full suite green: `uv run pytest -q` → **118 passed** (96 prior + 22 new; 0 skipped, ClickHouse up so integration ran).
+- Offline research verified `edgar.xbrl.standardization.reverse_index.get_standard_concept` against installed edgartools 5.43.0 with sockets blocked (zero network).
+- Live end-to-end (offline map path) against the real `default` DB: `map-canonical 320193` → 17,078 canonical facts from 24,852 Tier 0 facts (7,774 unmappable), 117 distinct canonical concepts. After `schema-init` refreshed the mart view, `screening_mart` returns correct Apple figures — FY2025 revenue $416.16B / net income $112.01B; assets $371.08B / liabilities $264.59B at 2026-03-28.
 
 ### Completion Notes List
 
+- **AC-1 (zero network):** mapping goes Tier 0 → Tier 1 with no EDGAR — the CLI builds no `EdgarClient`, sets no identity, issues no request. The standardizer is edgartools' bundled JSON taxonomy (`get_standard_concept`), proven offline by `test_standardize_is_offline` (blocks `socket.connect`). `canonical_fact` is keyed by raw-fact identity (AD-5) with `canonical_concept` + `taxonomy_version` (edgartools `5.43.0`) as attributes.
+- **AC-2 (unmappable → no row):** `standardize_concept` returns `None` for unknown/excluded tags; those produce no `canonical_fact` row and stay in Tier 0 (7,774 of Apple's rows).
+- **AC-3 (re-run upsert):** re-map inserts at a higher `next_canonical_version` on the same identity key; `ReplacingMergeTree(version)` + `FINAL` collapse to one row per key, higher version wins — verified across an `OPTIMIZE … FINAL` (`test_remap_idempotent_on_read`).
+- **Provenance:** `content_hash` is carried over verbatim from the Tier 0 row (not recomputed — Tier 1 drops `taxonomy`), preserving the AD-14 link to its source raw fact.
+- **Mart reconciliation (Task 6):** corrected the two `screening_mart` filter labels to edgartools' actual output (`Revenues→Revenue`, `NetIncomeLoss→NetIncome`); `Assets`/`Liabilities` matched already. Updated Story 1.2's `test_schema.py` synthetic `canonical_concept` literals in lockstep. **Operational note:** the mart is `CREATE OR REPLACE VIEW`, so an existing DB needs `schema-init` re-run to pick up the change (throwaway-DB tests build fresh and miss this — caught live).
+- **Layering:** `core/canonical.py` imports no `edgar` (AST-guarded); standardization is an injected port. The only new `edgar` importer is the pure-offline `adapters/edgar/standardize.py`.
+
 ### File List
+
+- `fintin/adapters/edgar/standardize.py` (NEW) — offline concept standardizer + taxonomy version.
+- `fintin/core/canonical.py` (NEW) — pure `to_canonical_fact_rows` transform + `map_company` orchestrator; `CanonicalFactRow`, `MapResult`.
+- `fintin/adapters/store/canonical_fact_repo.py` (NEW) — `insert_canonical_facts`, `next_canonical_version`, `CANONICAL_FACT_COLUMNS`.
+- `fintin/adapters/store/raw_fact_repo.py` (MOD) — added `read_raw_facts` (Tier 0 FINAL → `RawFactRow`).
+- `fintin/adapters/store/schema.py` (MOD) — `screening_mart` label reconciliation (`Revenue`/`NetIncome`).
+- `fintin/cli/app.py` (MOD) — `map-canonical CIK` command (offline; no EdgarClient).
+- `tests/test_standardize.py` (NEW), `tests/test_canonical.py` (NEW), `tests/test_canonical_fact_repo.py` (NEW).
+- `tests/test_schema.py` (MOD) — mart-label regression fix. `tests/test_cli.py` (MOD) — `map-canonical` error paths.
+- `README.md` (MOD) — Pipeline section (`schema-init` → `ingest-company` → `map-canonical`).
+- `_bmad-output/implementation-artifacts/deferred-work.md` (MOD) — Story 1.5 deferrals.
+
+## Change Log
+
+- 2026-07-24 — Story 1.5 implemented: Tier 0 → Tier 1 canonical mapping via edgartools offline standardization (zero network), `map-canonical` CLI, `screening_mart` label reconciliation. 118 tests pass; verified live on Apple through the full mart. Status → review.

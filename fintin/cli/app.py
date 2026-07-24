@@ -234,6 +234,94 @@ def ingest_company_command(
     )
 
 
+@app.command("map-canonical")
+def map_canonical_command(
+    cik: int = typer.Argument(
+        ..., help="SEC CIK whose Tier 0 facts to map into canonical Tier 1 (e.g. 320193)."
+    ),
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+) -> None:
+    """Map a company's Tier 0 raw facts to canonical Tier 1 (offline; zero EDGAR requests)."""
+    _configure_logging()
+    # Heavy import (edgar standardization taxonomy) deferred so --help /
+    # check-connection / schema-init stay fast.
+    from fintin.adapters.edgar.standardize import standardize_concept, taxonomy_version
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        next_canonical_version,
+    )
+    from fintin.adapters.store.raw_fact_repo import read_raw_facts
+    from fintin.core.canonical import map_company
+
+    # Validate the CIK before any work — cik is UInt32 in canonical_fact.
+    if not (1 <= cik <= 4_294_967_295):
+        typer.secho(
+            f"Invalid CIK {cik}: must be between 1 and 4294967295.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    logger.info(
+        "Mapping CIK %s to canonical Tier 1 (database=%s)", cik, cfg.clickhouse.database
+    )
+
+    # Mapping is zero-network (AC-1): it needs NO EdgarClient and NO contact email —
+    # only ClickHouse. Surface connection/auth/missing-database problems clearly.
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # Ingest-monotonic Tier 1 version from the store (AD-6), not a wall clock.
+        version = next_canonical_version(client)
+        result = map_company(
+            cik,
+            read_raw_facts=lambda c: read_raw_facts(client, c),
+            standardize=standardize_concept,
+            insert_rows=lambda rows: insert_canonical_facts(client, rows),
+            taxonomy_version=taxonomy_version(),
+            version=version,
+        )
+    except Exception as exc:  # read/map/insert error (connection already verified)
+        typer.secho(f"Mapping failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    if result.raw_seen == 0:
+        typer.secho(
+            f"No Tier 0 facts for CIK {cik} — run `fintin ingest-company {cik}` first.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.secho(
+        f"Mapped CIK {cik}: {result.mapped} canonical facts from {result.raw_seen} "
+        f"Tier 0 facts ({result.unmapped} tags unmappable, kept in Tier 0 only) "
+        f"into database '{cfg.clickhouse.database}'.",
+        fg=typer.colors.GREEN,
+    )
+
+
 def main() -> None:
     app()
 
