@@ -1,0 +1,28 @@
+# fin-tin configuration TEMPLATE.
+#
+# Copy this to `fintin.toml` and fill in your values:
+#
+#     cp fintin.toml.example fintin.toml
+#
+# `fintin.toml` is gitignored — this repo is public, so your real EDGAR contact
+# email must never be committed. Edit only your local copy.
+
+[clickhouse]
+host = "localhost"
+port = 8123
+username = "default"
+password = "fintin_local"   # matches CLICKHOUSE_PASSWORD in docker-compose.yml (local-only)
+database = "default"
+
+[edgar]
+# EDGAR fair-access compliance (BAN-CRITICAL). EDGAR requires a declared,
+# identifying User-Agent with REAL contact info; a blank/placeholder UA is
+# rejected as an "Undeclared Automated Tool". Set contact_email to YOUR real
+# address in your local fintin.toml before running against EDGAR — the EDGAR
+# client rejects the placeholder below at startup, so the tool fails loudly
+# rather than send a bad User-Agent.
+user_agent_name  = "fin-tin"
+contact_email    = "you@example.com"   # <-- REPLACE with your real email in fintin.toml
+rate_limit_per_sec = 9                 # SEC max is 10; 9 leaves a safety margin (1 <= x <= 10)
+cooldown_seconds   = 600               # >= 600 (SEC 10-minute cool-down on a throttle breach)
+max_throttle_retries = 3               # cool-down + retry attempts before failing loudly
