@@ -1,0 +1,13 @@
+# fin-tin configuration.
+#
+# Story 1.1 uses only the [clickhouse] connection block. Later stories add
+# [universe] (CIK/ticker list), [edgar] (rate ceiling, identifying User-Agent +
+# contact email), [lease] (path), and LOOKBACK. Those blocks are tolerated but
+# not required yet.
+
+[clickhouse]
+host = "localhost"
+port = 8123
+username = "default"
+password = "fintin_local"   # must match CLICKHOUSE_PASSWORD in docker-compose.yml
+database = "default"
