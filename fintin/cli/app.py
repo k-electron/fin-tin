@@ -138,6 +138,102 @@ def schema_init_command(
     )
 
 
+@app.command("ingest-company")
+def ingest_company_command(
+    cik: int = typer.Argument(..., help="SEC CIK of the company to ingest (e.g. 320193)."),
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+) -> None:
+    """Ingest one company's standard-taxonomy facts into Tier 0 (raw_fact)."""
+    _configure_logging()
+    # edgartools is a heavy import — defer it so --help / check-connection /
+    # schema-init stay fast and only pay for it when actually ingesting.
+    from fintin.adapters.edgar.client import (
+        EdgarClient,
+        EdgarConfigError,
+        EdgarThrottleError,
+    )
+    from fintin.adapters.edgar.facts import (
+        NoCompanyFactsError,
+        edgartools_version,
+        fetch_company_facts,
+    )
+    from fintin.adapters.store.raw_fact_repo import insert_raw_facts, next_ingest_version
+    from fintin.core.ingest import ingest_company
+
+    # Validate the CIK before any work — cik is UInt32 in raw_fact, and a bad
+    # value would otherwise waste an EDGAR fetch before failing at insert.
+    if not (1 <= cik <= 4_294_967_295):
+        typer.secho(
+            f"Invalid CIK {cik}: must be between 1 and 4294967295.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Build the rate-limited EDGAR client — its gate refuses a blank/placeholder
+    # contact email before any request is made (ban-safety, FR-1).
+    try:
+        edgar_client = EdgarClient(cfg)
+    except EdgarConfigError as exc:
+        typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    logger.info(
+        "Ingesting CIK %s into Tier 0 (database=%s)", cik, cfg.clickhouse.database
+    )
+
+    # Surface connection/auth/missing-database problems clearly before fetching.
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # Ingest-monotonic version from the store (AD-6), not a wall clock.
+        version = next_ingest_version(client)
+        result = ingest_company(
+            cik,
+            fetch_facts=lambda c: fetch_company_facts(edgar_client, c),
+            insert_rows=lambda rows: insert_raw_facts(client, rows),
+            taxonomy_version=edgartools_version(),
+            version=version,
+        )
+    except NoCompanyFactsError as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
+    except EdgarThrottleError as exc:
+        typer.secho(f"EDGAR throttled, gave up: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:  # fetch/insert error (connection already verified)
+        typer.secho(f"Ingest failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    typer.secho(
+        f"Ingested CIK {cik}: {result.rows_landed} facts landed "
+        f"({result.dropped} dropped of {result.facts_seen} seen) "
+        f"into database '{cfg.clickhouse.database}'.",
+        fg=typer.colors.GREEN,
+    )
+
+
 def main() -> None:
     app()
 
