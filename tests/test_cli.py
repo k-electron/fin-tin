@@ -116,3 +116,50 @@ def test_map_canonical_invalid_cik_reports_clean_error():
     assert result.exit_code == 2
     assert "Invalid CIK" in result.output
     assert "Traceback" not in result.output
+
+
+# --- universe (Story 2.1) ------------------------------------------------------
+# Offline: resolution reads edgartools' bundled table (no ClickHouse, no network).
+
+
+def test_help_lists_universe():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "universe" in result.output
+
+
+def test_universe_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["universe", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_universe_missing_section_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)  # valid [clickhouse], no [universe]
+    result = runner.invoke(app, ["universe", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "[universe]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_universe_resolves_and_reports_gap(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        _CH_ONLY + '\n[universe]\ntickers = ["AAPL", "ZZZZINVALID"]\n'
+    )
+    result = runner.invoke(app, ["universe", "--config", str(p)])
+    assert result.exit_code == 0  # gaps are recorded, not fatal
+    assert "1 companies" in result.output  # AAPL resolved
+    assert "ZZZZINVALID" in result.output  # the gap is surfaced, not silently dropped
+    assert "Traceback" not in result.output
+
+
+def test_universe_show_ciks_prints_resolved_cik(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n")
+    result = runner.invoke(app, ["universe", "--config", str(p), "--show-ciks"])
+    assert result.exit_code == 0
+    assert "320193" in result.output

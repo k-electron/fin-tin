@@ -52,9 +52,32 @@ class EdgarConfig:
 
 
 @dataclass(frozen=True)
+class UniverseConfig:
+    """The configured screening Universe (FR-7, AD-13): a static list of tickers
+    and/or CIKs. Tickers are resolved to CIKs at run time via edgartools'
+    bundled reference table (offline, no network) — see
+    ``fintin.adapters.edgar.universe`` / ``fintin.core.universe``.
+
+    Load-time validation here is STRUCTURE + TYPES + RANGES only. Whether a
+    (well-formed) ticker actually resolves is decided at resolve time — an
+    unknown ticker loads cleanly and later surfaces as an explained gap, never a
+    silent drop (SM-2). ``tickers`` are kept verbatim (normalization to the
+    lookup key form happens at resolve time). The Universe is **derived from
+    config, never persisted** (AD-1)."""
+
+    tickers: tuple[str, ...]
+    ciks: tuple[int, ...]
+
+
+# CIK is a UInt32 in the store (AD "Identity" convention), so 1..2^32-1.
+_CIK_MAX = 4_294_967_295
+
+
+@dataclass(frozen=True)
 class Config:
     clickhouse: ClickHouseConfig
     edgar: EdgarConfig | None = None
+    universe: UniverseConfig | None = None
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
@@ -90,7 +113,16 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             raise ConfigError(f"[edgar] in {path} must be a table/section.")
         edgar = _parse_edgar(ed, path)
 
-    return Config(clickhouse=_parse_clickhouse(ch, path), edgar=edgar)
+    un = data.get("universe")
+    universe = None
+    if un is not None:
+        if not isinstance(un, dict):
+            raise ConfigError(f"[universe] in {path} must be a table/section.")
+        universe = _parse_universe(un, path)
+
+    return Config(
+        clickhouse=_parse_clickhouse(ch, path), edgar=edgar, universe=universe
+    )
 
 
 def _parse_clickhouse(ch: dict, path: Path) -> ClickHouseConfig:
@@ -192,3 +224,47 @@ def _parse_edgar(ed: dict, path: Path) -> EdgarConfig:
         cooldown_seconds=cooldown,
         max_throttle_retries=retries,
     )
+
+
+def _parse_universe(un: dict, path: Path) -> UniverseConfig:
+    # Structure/type/range checks only (no resolvability check — that is a
+    # resolve-time concern; an unknown-but-well-formed ticker loads fine).
+    tickers_raw = un.get("tickers", [])
+    ciks_raw = un.get("ciks", [])
+
+    if not isinstance(tickers_raw, list):
+        raise ConfigError(f"[universe].tickers in {path} must be a list of strings.")
+    if not isinstance(ciks_raw, list):
+        raise ConfigError(f"[universe].ciks in {path} must be a list of integers.")
+
+    tickers: list[str] = []
+    for t in tickers_raw:
+        # bool is a str-incompatible scalar; a non-string (or blank) ticker is a
+        # config mistake, not something to silently coerce/skip.
+        if not isinstance(t, str) or not t.strip():
+            raise ConfigError(
+                f"[universe].tickers in {path} must be non-empty strings, got {t!r}."
+            )
+        tickers.append(t)
+
+    ciks: list[int] = []
+    for c in ciks_raw:
+        # bool subclasses int — reject it before the range check so `ciks = [true]`
+        # is not silently accepted as CIK 1.
+        if isinstance(c, bool) or not isinstance(c, int):
+            raise ConfigError(
+                f"[universe].ciks in {path} must be integers, got {c!r}."
+            )
+        if not (1 <= c <= _CIK_MAX):
+            raise ConfigError(
+                f"[universe].ciks in {path} must be between 1 and {_CIK_MAX} "
+                f"(CIK is a UInt32), got {c}."
+            )
+        ciks.append(c)
+
+    if not tickers and not ciks:
+        raise ConfigError(
+            f"[universe] in {path} is empty — list at least one ticker or cik."
+        )
+
+    return UniverseConfig(tickers=tuple(tickers), ciks=tuple(ciks))

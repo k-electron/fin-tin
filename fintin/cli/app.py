@@ -318,6 +318,65 @@ def map_canonical_command(
     )
 
 
+@app.command("universe")
+def universe_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    show_ciks: bool = typer.Option(
+        False,
+        "--show-ciks",
+        help="Also print the full sorted list of resolved CIKs.",
+    ),
+) -> None:
+    """Resolve the configured [universe] to CIKs and report scope + explained gaps.
+
+    Offline: tickers resolve via edgartools' bundled reference table (no EDGAR
+    request, no contact email needed). Unresolvable tickers are reported as
+    explained gaps, never silently dropped."""
+    _configure_logging()
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    if cfg.universe is None:
+        typer.secho(
+            "Config error: no [universe] section in "
+            f"{config} — list tickers and/or ciks to define the Universe.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Resolution is offline (bundled reference table) — no ClickHouse, no
+    # EdgarClient. Defer the heavy `edgar` import to keep --help / config-error
+    # paths fast (it only loads when a ticker actually needs resolving).
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.core.universe import resolve_universe
+
+    resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+
+    typer.secho(
+        f"Universe: {len(resolved.ciks)} companies "
+        f"({resolved.explicit_ciks} from CIKs, {resolved.tickers_resolved} from tickers).",
+        fg=typer.colors.GREEN,
+    )
+    if resolved.gaps:
+        typer.secho(
+            f"{len(resolved.gaps)} unresolved (explained gaps):",
+            fg=typer.colors.YELLOW,
+        )
+        for gap in resolved.gaps:
+            typer.secho(f"  - {gap.identifier}: {gap.reason}", fg=typer.colors.YELLOW)
+    if show_ciks:
+        typer.echo(" ".join(str(c) for c in resolved.ciks))
+
+
 def main() -> None:
     app()
 

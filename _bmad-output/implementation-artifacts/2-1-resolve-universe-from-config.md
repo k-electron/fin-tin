@@ -1,6 +1,9 @@
+---
+baseline_commit: 2cd12d56485d85f22f59366de1c888ffd4f41aa0
+---
 # Story 2.1: Resolve the Universe from config
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -29,33 +32,33 @@ edgartools 5.43.0 resolves tickers→CIK from a **bundled parquet** (`edgar/refe
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Parse `[universe]` in config (offline, structure/types/ranges only)** (AC: 2, 3) — `fintin/config.py`
-  - [ ] Add a frozen `UniverseConfig(tickers: tuple[str, ...], ciks: tuple[int, ...])` dataclass and `universe: UniverseConfig | None = None` on `Config` (mirror the optional `[edgar]` pattern — absent section → `None`, so non-universe commands are unaffected).
-  - [ ] `_parse_universe(u, path)`: `tickers` must be a list of non-empty strings; `ciks` a list of ints in `[1, 4_294_967_295]` (UInt32, same range guard as the CLI CIK args). Reject `bool` explicitly (it subclasses `int`) — mirror the `_parse_clickhouse`/`_parse_edgar` type guards. Both keys optional individually, but **at least one non-empty** — an empty Universe is a `ConfigError` (nothing to ingest). Trim/keep tickers verbatim here (normalization happens at resolve).
-  - [ ] Keep validation **offline and semantic-free** here (structure/types/ranges), consistent with the config layer's contract — ticker *resolvability* is decided at resolve time, not load time (an unknown-but-well-formed ticker loads fine, then becomes a gap).
-- [ ] **Task 2 — Pure Universe resolution in core** (AC: 1, 2, 3) — `fintin/core/universe.py` (NEW, pure; no `edgar`, no ClickHouse)
-  - [ ] `UniverseGap(NamedTuple)`: `identifier: str`, `reason: str`. `ResolvedUniverse(NamedTuple)`: `ciks: tuple[int, ...]` (sorted, deduplicated), `gaps: tuple[UniverseGap, ...]`, `tickers_resolved: int`, `explicit_ciks: int`.
-  - [ ] `resolve_universe(universe: UniverseConfig, *, resolve_tickers: Callable[[Sequence[str]], dict[str, int | None]]) -> ResolvedUniverse`: start from the explicit `ciks`; call the injected **batch** `resolve_tickers(tickers)` once; fold resolved CIKs into the set; a `None`/missing mapping → append a `UniverseGap(ticker, "not found in edgartools reference data")`. Deduplicate (a ticker resolving to an already-listed CIK is a union, not a duplicate). Return CIKs **sorted** for deterministic output. Do not call the resolver when there are no tickers (pure-CIK universes need no resolver).
-  - [ ] `resolve_tickers` is an injected **port** (same inversion as `ingest_company`'s `fetch_facts`/`insert_rows`) so core stays edgar-free and unit-testable with a fake resolver.
-  - [ ] Universe is **derived, never stored** (AD-1) — `resolve_universe` returns a value; nothing persists it. (Backfill in Story 2.3 calls this same function to get its scope.)
-- [ ] **Task 3 — edgartools bundled-table resolver adapter** (AC: 1, 2) — `fintin/adapters/edgar/universe.py` (NEW)
-  - [ ] `resolve_tickers(tickers: Sequence[str]) -> dict[str, int | None]` using `edgar.reference.tickers.get_company_cik_lookup()` (bundled, offline). Load the lookup **once**, normalize each input ticker (`strip().upper()`, `.`→`-`), map to `int(cik)` or `None`. Return keyed by the **original** configured ticker string (so the CLI can report the exact config value in a gap).
-  - [ ] This is the ONLY new module importing `edgar` (all `edgar` imports live in `adapters/edgar/`). Add a module docstring stating it is offline (bundled reference data, no EDGAR request, AD-3 not triggered) and WHY the dict getter is used instead of `find_cik` (avoids the live per-ticker fallback).
-- [ ] **Task 4 — `fintin universe` CLI command** (AC: 1, 2, 3) — `fintin/cli/app.py`
-  - [ ] New `universe` command: load config (→ `ConfigError` exit 2), require a non-empty `[universe]` (else clean error exit 2), lazily import the core resolver + edgar adapter (defer the heavy `edgar` import like `ingest-company` does), call `resolve_universe`, and render: count of companies in the resolved Universe, how many came from explicit CIKs vs resolved tickers, and each **explained gap** (unresolved ticker + reason). Exit **0** even with gaps (recorded, not fatal); exit 2 only on config/structure errors.
-  - [ ] No ClickHouse connection and no `EdgarClient` — resolution is offline. Do NOT construct `EdgarClient` (it would demand a real email for an offline op).
-  - [ ] Add a `--show-ciks` flag to also print the sorted resolved CIK list (default: summary + gaps only, since the full list can be 500 long).
-  - [ ] Error rendering matches the house style: `typer.secho(..., fg=RED, err=True)` + `raise typer.Exit(code=...)`; never leak a traceback.
-- [ ] **Task 5 — Config template** — `fintin.toml.example` (tracked; public repo)
-  - [ ] Add a `[universe]` block with a **representative** illustrative set (a dozen or so well-known S&P 500 tickers) + one or two example `ciks`, with a comment that the operator populates the full S&P 500 list here and that tickers/CIKs are public (safe to commit; unlike the contact email). Note that unresolved tickers surface as explained gaps.
-- [ ] **Task 6 — Tests (never live EDGAR; NFR-7)** — `tests/`
-  - [ ] `tests/test_config.py`: `[universe]` parsing — valid tickers+ciks; absent section → `universe is None`; both-empty / missing section for the universe path → `ConfigError`; non-string ticker, non-int CIK, `bool` CIK, out-of-range CIK (0 and > 4_294_967_295) all → `ConfigError`; a pure-CIK universe (no tickers) parses.
-  - [ ] `tests/test_universe.py` (NEW, pure): `resolve_universe` with an **injected fake** `resolve_tickers` — tickers union with explicit CIKs; an unresolved ticker (`None`) becomes a `UniverseGap` and the rest still resolve; duplicate CIK (ticker resolves to an explicit CIK) deduped; CIKs returned sorted; adding a CIK grows the set (AC-3); a pure-CIK universe never calls the resolver. Plus an **AST import-guard** (like `test_canonical.py`) asserting `fintin/core/universe.py` imports no `edgar`.
-  - [ ] `tests/test_edgar_universe.py` (NEW): the real adapter offline — `AAPL` → `320193`, `BRK.B`/`brk.b` normalize and resolve, a nonsense ticker (`Z> ZZINVALID`) → `None`. Include ONE test that blocks the network (patch `socket.socket.connect` + `socket.create_connection` to raise, **after** importing edgar) and asserts a resolve still succeeds — a hard NFR-7 proof that the bundled path touches no socket. (Do not null out `socket.socket` itself — that breaks ssl import; block only the connect methods, per the Story 1.4 lesson.)
-  - [ ] `tests/test_cli.py`: `--help` lists `universe`; missing config → exit 2 + "Config error" + no Traceback; missing `[universe]` → clean error exit 2; a config with a bogus ticker → exit 0, output names the ticker as a gap, no Traceback; `--show-ciks` prints a resolved CIK. These are offline (bundled resolver) — no ClickHouse, no integration marker.
-- [ ] **Task 7 — Validate & document**
-  - [ ] `uv run pytest` green (unit + integration with ClickHouse up — this story adds no integration tests, but must not regress existing ones).
-  - [ ] README: add `[universe]` to the Configuration section and a short "Define your Universe" note (tickers resolve offline via edgartools' bundled table; unresolved tickers are explained gaps; add CIKs to grow it). Do NOT overstate — no backfill yet (that's Story 2.3); `fintin universe` only resolves + reports scope.
+- [x] **Task 1 — Parse `[universe]` in config (offline, structure/types/ranges only)** (AC: 2, 3) — `fintin/config.py`
+  - [x] Add a frozen `UniverseConfig(tickers: tuple[str, ...], ciks: tuple[int, ...])` dataclass and `universe: UniverseConfig | None = None` on `Config` (mirror the optional `[edgar]` pattern — absent section → `None`, so non-universe commands are unaffected).
+  - [x] `_parse_universe(u, path)`: `tickers` must be a list of non-empty strings; `ciks` a list of ints in `[1, 4_294_967_295]` (UInt32, same range guard as the CLI CIK args). Reject `bool` explicitly (it subclasses `int`) — mirror the `_parse_clickhouse`/`_parse_edgar` type guards. Both keys optional individually, but **at least one non-empty** — an empty Universe is a `ConfigError` (nothing to ingest). Trim/keep tickers verbatim here (normalization happens at resolve).
+  - [x] Keep validation **offline and semantic-free** here (structure/types/ranges), consistent with the config layer's contract — ticker *resolvability* is decided at resolve time, not load time (an unknown-but-well-formed ticker loads fine, then becomes a gap).
+- [x] **Task 2 — Pure Universe resolution in core** (AC: 1, 2, 3) — `fintin/core/universe.py` (NEW, pure; no `edgar`, no ClickHouse)
+  - [x] `UniverseGap(NamedTuple)`: `identifier: str`, `reason: str`. `ResolvedUniverse(NamedTuple)`: `ciks: tuple[int, ...]` (sorted, deduplicated), `gaps: tuple[UniverseGap, ...]`, `tickers_resolved: int`, `explicit_ciks: int`.
+  - [x] `resolve_universe(universe: UniverseConfig, *, resolve_tickers: Callable[[Sequence[str]], dict[str, int | None]]) -> ResolvedUniverse`: start from the explicit `ciks`; call the injected **batch** `resolve_tickers(tickers)` once; fold resolved CIKs into the set; a `None`/missing mapping → append a `UniverseGap(ticker, "not found in edgartools reference data")`. Deduplicate (a ticker resolving to an already-listed CIK is a union, not a duplicate). Return CIKs **sorted** for deterministic output. Do not call the resolver when there are no tickers (pure-CIK universes need no resolver).
+  - [x] `resolve_tickers` is an injected **port** (same inversion as `ingest_company`'s `fetch_facts`/`insert_rows`) so core stays edgar-free and unit-testable with a fake resolver.
+  - [x] Universe is **derived, never stored** (AD-1) — `resolve_universe` returns a value; nothing persists it. (Backfill in Story 2.3 calls this same function to get its scope.)
+- [x] **Task 3 — edgartools bundled-table resolver adapter** (AC: 1, 2) — `fintin/adapters/edgar/universe.py` (NEW)
+  - [x] `resolve_tickers(tickers: Sequence[str]) -> dict[str, int | None]` using `edgar.reference.tickers.get_company_cik_lookup()` (bundled, offline). Load the lookup **once**, normalize each input ticker (`strip().upper()`, `.`→`-`), map to `int(cik)` or `None`. Return keyed by the **original** configured ticker string (so the CLI can report the exact config value in a gap).
+  - [x] This is the ONLY new module importing `edgar` (all `edgar` imports live in `adapters/edgar/`). Add a module docstring stating it is offline (bundled reference data, no EDGAR request, AD-3 not triggered) and WHY the dict getter is used instead of `find_cik` (avoids the live per-ticker fallback).
+- [x] **Task 4 — `fintin universe` CLI command** (AC: 1, 2, 3) — `fintin/cli/app.py`
+  - [x] New `universe` command: load config (→ `ConfigError` exit 2), require a non-empty `[universe]` (else clean error exit 2), lazily import the core resolver + edgar adapter (defer the heavy `edgar` import like `ingest-company` does), call `resolve_universe`, and render: count of companies in the resolved Universe, how many came from explicit CIKs vs resolved tickers, and each **explained gap** (unresolved ticker + reason). Exit **0** even with gaps (recorded, not fatal); exit 2 only on config/structure errors.
+  - [x] No ClickHouse connection and no `EdgarClient` — resolution is offline. Do NOT construct `EdgarClient` (it would demand a real email for an offline op).
+  - [x] Add a `--show-ciks` flag to also print the sorted resolved CIK list (default: summary + gaps only, since the full list can be 500 long).
+  - [x] Error rendering matches the house style: `typer.secho(..., fg=RED, err=True)` + `raise typer.Exit(code=...)`; never leak a traceback.
+- [x] **Task 5 — Config template** — `fintin.toml.example` (tracked; public repo)
+  - [x] Add a `[universe]` block with a **representative** illustrative set (a dozen or so well-known S&P 500 tickers) + one or two example `ciks`, with a comment that the operator populates the full S&P 500 list here and that tickers/CIKs are public (safe to commit; unlike the contact email). Note that unresolved tickers surface as explained gaps.
+- [x] **Task 6 — Tests (never live EDGAR; NFR-7)** — `tests/`
+  - [x] `tests/test_config.py`: `[universe]` parsing — valid tickers+ciks; absent section → `universe is None`; both-empty / missing section for the universe path → `ConfigError`; non-string ticker, non-int CIK, `bool` CIK, out-of-range CIK (0 and > 4_294_967_295) all → `ConfigError`; a pure-CIK universe (no tickers) parses.
+  - [x] `tests/test_universe.py` (NEW, pure): `resolve_universe` with an **injected fake** `resolve_tickers` — tickers union with explicit CIKs; an unresolved ticker (`None`) becomes a `UniverseGap` and the rest still resolve; duplicate CIK (ticker resolves to an explicit CIK) deduped; CIKs returned sorted; adding a CIK grows the set (AC-3); a pure-CIK universe never calls the resolver. Plus an **AST import-guard** (like `test_canonical.py`) asserting `fintin/core/universe.py` imports no `edgar`.
+  - [x] `tests/test_edgar_universe.py` (NEW): the real adapter offline — `AAPL` → `320193`, `BRK.B`/`brk.b` normalize and resolve, a nonsense ticker (`Z> ZZINVALID`) → `None`. Include ONE test that blocks the network (patch `socket.socket.connect` + `socket.create_connection` to raise, **after** importing edgar) and asserts a resolve still succeeds — a hard NFR-7 proof that the bundled path touches no socket. (Do not null out `socket.socket` itself — that breaks ssl import; block only the connect methods, per the Story 1.4 lesson.)
+  - [x] `tests/test_cli.py`: `--help` lists `universe`; missing config → exit 2 + "Config error" + no Traceback; missing `[universe]` → clean error exit 2; a config with a bogus ticker → exit 0, output names the ticker as a gap, no Traceback; `--show-ciks` prints a resolved CIK. These are offline (bundled resolver) — no ClickHouse, no integration marker.
+- [x] **Task 7 — Validate & document**
+  - [x] `uv run pytest` green (unit + integration with ClickHouse up — this story adds no integration tests, but must not regress existing ones).
+  - [x] README: add `[universe]` to the Configuration section and a short "Define your Universe" note (tickers resolve offline via edgartools' bundled table; unresolved tickers are explained gaps; add CIKs to grow it). Do NOT overstate — no backfill yet (that's Story 2.3); `fintin universe` only resolves + reports scope.
 
 ## Dev Notes
 
@@ -119,8 +122,32 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 
 ### Debug Log References
 
+- Full suite green: `uv run pytest -q` → **165 passed** (was 132; +33 for this story). No regressions.
+- Verified `edgar.reference.tickers.get_company_cik_lookup()` returns a `dict` (~10,390 entries, `int` values) offline: `AAPL`→320193, `BRK-B`→1067983, `MSFT`→789019, `AMZN`→1018724.
+- Smoke test `fintin universe` on a temp config (`tickers=["AAPL","MSFT","BRK.B","ZZZZINVALID"]`, `ciks=[1018724]`): `Universe: 4 companies (1 from CIKs, 3 from tickers)` + `ZZZZINVALID` reported as an explained gap; `--show-ciks` → `320193 789019 1018724 1067983` (sorted, deduped).
+
 ### Completion Notes List
+
+- **AC-1 (offline resolution).** `resolve_universe` (pure core) unions explicitly-listed CIKs with the tickers resolved by an injected batch `resolve_tickers` port. The edgar adapter (`adapters/edgar/universe.py`) implements that port over edgartools' **bundled** `company_tickers.parquet` via `get_company_cik_lookup()` — a file read, **zero network** (AD-3 not triggered; no `EdgarClient`/email). `test_resolution_touches_no_socket` blocks `socket.socket.connect` + `socket.create_connection` (after edgar import; caches cleared to force an uncached rebuild) and proves resolution still succeeds — a hard NFR-7 guard.
+- **AC-2 (gaps + config errors).** An unresolvable ticker → `UniverseGap(ticker, reason)` surfaced by `fintin universe` (exit 0, non-fatal; the rest still resolve — SM-2). Structural problems (missing `[universe]`, both lists empty, non-string ticker, non-int/`bool`/out-of-range CIK) → `ConfigError` → CLI exit 2, no traceback.
+- **AC-3 (NFR-2).** The Universe is derived from config each run — nothing persists it (AD-1). `test_adding_a_cik_grows_the_universe_no_code_change` proves adding a CIK grows the set with no code/schema change. `fintin.toml.example` gained a `[universe]` block (public data; no email).
+- **Design decision honored:** used the bundled dict getter, NOT `find_cik`/`Company` (which have a per-ticker live SEC fallback) — keeps resolution guaranteed-offline/deterministic and turns an absent ticker into a clean `None`.
+- **Purity locked:** AST guard asserts `core/universe.py` imports no `edgar`; `adapters/edgar/universe.py` is the only new module importing `edgar` (lazily, inside the function).
+- No schema/DDL change; `adapters/store` untouched. No new dependency.
 
 ### File List
 
+- `fintin/config.py` (MOD) — `UniverseConfig` dataclass + `universe` field on `Config`; `_parse_universe` (structure/type/range guards, `bool`-rejects-before-int, empty-Universe error); wired into `load_config`.
+- `fintin/core/universe.py` (NEW) — pure `resolve_universe` + `ResolvedUniverse`/`UniverseGap`; injected batch `resolve_tickers` port; derived-not-persisted (AD-1).
+- `fintin/adapters/edgar/universe.py` (NEW) — offline `resolve_tickers` over edgartools' bundled table (`get_company_cik_lookup`), ticker normalization (`upper`, `.`→`-`), original-key preservation; docstring explains offline + why not `find_cik`.
+- `fintin/cli/app.py` (MOD) — `universe` command (offline; no ClickHouse/`EdgarClient`; `--show-ciks`; config/section errors → exit 2; gaps non-fatal exit 0).
+- `fintin.toml.example` (MOD) — `[universe]` block (representative S&P 500 tickers + example `ciks`; public-data note).
+- `tests/test_config.py` (MOD) — `[universe]` parse + rejection cases.
+- `tests/test_universe.py` (NEW) — pure `resolve_universe` (union/dedup/sort, gap, pure-CIK skips resolver, NFR-2 growth, config-ordered gaps) + AST edgar-free guard.
+- `tests/test_edgar_universe.py` (NEW) — offline adapter (known/normalized/unknown/batch) + socket-block NFR-7 proof.
+- `tests/test_cli.py` (MOD) — `universe` help/missing-config/missing-section/gap/`--show-ciks`.
+- `README.md` (MOD) — `[universe]` in Configuration + a "Define your Universe" section.
+
 ## Change Log
+
+- 2026-07-24 — Story 2.1 implemented: resolve the configured Universe (tickers and/or CIKs) to a deduplicated, sorted CIK set. Ticker→CIK resolution is **offline** via edgartools' bundled reference table (`get_company_cik_lookup`) — no EDGAR request, no contact email (AD-3 not triggered); the plain dict getter is used deliberately over `find_cik` to avoid its live network fallback. Pure core `resolve_universe` with an injected batch resolver port; offline edgar adapter; a `fintin universe` CLI trigger (`--show-ciks`). Unresolvable tickers → explained gaps (SM-2); the Universe is derived from config, never persisted (AD-1). 165 tests pass (+33). Status → review.

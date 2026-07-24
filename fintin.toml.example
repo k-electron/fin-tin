@@ -26,3 +26,22 @@ contact_email    = "you@example.com"   # <-- REPLACE with your real email in fin
 rate_limit_per_sec = 9                 # SEC max is 10; 9 leaves a safety margin (1 <= x <= 10)
 cooldown_seconds   = 600               # >= 600 (SEC 10-minute cool-down on a throttle breach)
 max_throttle_retries = 3               # cool-down + retry attempts before failing loudly
+
+[universe]
+# The screening Universe: a static list of tickers and/or CIKs (FR-7, AD-13).
+# Tickers and CIKs are PUBLIC data (safe to commit here) — unlike contact_email.
+# Populate the full S&P 500 list below; this is just a representative sample.
+#
+# Tickers resolve to CIKs OFFLINE via edgartools' bundled reference table (no
+# EDGAR request, no email needed) — run `fintin universe` to resolve & report
+# scope. A ticker not in the bundled table is reported as an explained gap
+# (never silently dropped); resolve it by adding its numeric `cik` directly.
+# Grow the Universe by editing this list alone — no code or schema change (NFR-2).
+tickers = [
+    "AAPL", "MSFT", "AMZN", "GOOGL", "META", "NVDA", "BRK.B", "JPM",
+    "JNJ", "V", "PG", "XOM", "WMT", "KO", "DIS",
+]
+ciks = [
+    # Alphabet Class C (GOOG) by CIK, as an example of a direct entry.
+    # 1652044,
+]
