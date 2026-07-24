@@ -1,3 +1,19 @@
 .bmad-loop/runs/
 .bmad-loop/cache/
 .bmad-loop/policy.toml
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+dist/
+build/
+*.egg-info/
+
+# macOS
+.DS_Store
+
+# BMAD agent memory logs (per-run churn)
+_bmad-output/**/.memlog.md
+
