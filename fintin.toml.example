@@ -23,6 +23,6 @@ database = "default"
 # rather than send a bad User-Agent.
 user_agent_name  = "fin-tin"
 contact_email    = "you@example.com"   # <-- REPLACE with your real email in fintin.toml
-rate_limit_per_sec = 10                # SEC max; may be set lower for margin (0 < x <= 10)
+rate_limit_per_sec = 9                 # SEC max is 10; 9 leaves a safety margin (1 <= x <= 10)
 cooldown_seconds   = 600               # >= 600 (SEC 10-minute cool-down on a throttle breach)
 max_throttle_retries = 3               # cool-down + retry attempts before failing loudly

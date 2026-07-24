@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import edgar
@@ -20,6 +21,7 @@ from edgar import httpclient
 from edgar.httprequests import TooManyRequestsError
 
 from fintin.adapters.edgar.client import (
+    _MAX_COOLDOWN_SECONDS,
     EdgarClient,
     EdgarConfigError,
     EdgarThrottleError,
@@ -29,6 +31,32 @@ from fintin.config import ClickHouseConfig, Config, EdgarConfig
 _CH = ClickHouseConfig(
     host="localhost", port=8123, username="default", password="", database="default"
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_edgar_globals():
+    """Constructing an EdgarClient mutates process-global edgar state (identity,
+    EDGAR_RATE_LIMIT_PER_SEC, HTTP_MGR). Snapshot and restore it around each test
+    so nothing leaks across tests or into the wider process."""
+    saved_mgr = httpclient.HTTP_MGR
+    saved_rate = os.environ.get("EDGAR_RATE_LIMIT_PER_SEC")
+    try:
+        saved_identity = edgar.get_identity()
+    except Exception:
+        saved_identity = None
+    try:
+        yield
+    finally:
+        httpclient.HTTP_MGR = saved_mgr
+        if saved_rate is None:
+            os.environ.pop("EDGAR_RATE_LIMIT_PER_SEC", None)
+        else:
+            os.environ["EDGAR_RATE_LIMIT_PER_SEC"] = saved_rate
+        if saved_identity:
+            try:
+                edgar.set_identity(saved_identity)
+            except Exception:
+                pass
 
 
 def _config(**edgar_overrides) -> Config:
@@ -92,7 +120,7 @@ def test_request_headers_carry_ua_and_accept_encoding():
 # --- AC-2: throttle failure -> Retry-After / >=10-min cool-down -> retry --------
 
 
-def test_cooldown_then_retry_succeeds():
+def test_cooldown_uses_floor_when_no_retry_after():
     sleeper = _Recorder()
     client = EdgarClient(_config(), sleep=sleeper)
     calls = {"n": 0}
@@ -108,7 +136,9 @@ def test_cooldown_then_retry_succeeds():
     assert calls["n"] == 2
 
 
-def test_cooldown_honors_retry_after_when_present():
+def test_retry_after_below_floor_is_raised_to_floor():
+    """Ban-safety: a Retry-After shorter than the ≥10-min floor must NOT shorten
+    the wait — retrying inside the SEC block extends it."""
     sleeper = _Recorder()
     client = EdgarClient(_config(), sleep=sleeper)
     calls = {"n": 0}
@@ -120,7 +150,37 @@ def test_cooldown_honors_retry_after_when_present():
         return "ok"
 
     assert client.run(op) == "ok"
-    assert sleeper.waits == [42]  # honored the header value
+    assert sleeper.waits == [600]  # floored, NOT 42
+
+
+def test_retry_after_above_floor_is_honored():
+    sleeper = _Recorder()
+    client = EdgarClient(_config(), sleep=sleeper)
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TooManyRequestsError("https://sec.gov/x", retry_after=900)
+        return "ok"
+
+    assert client.run(op) == "ok"
+    assert sleeper.waits == [900]  # honored a Retry-After longer than the floor
+
+
+def test_huge_retry_after_is_capped():
+    sleeper = _Recorder()
+    client = EdgarClient(_config(), sleep=sleeper)
+    calls = {"n": 0}
+
+    def op():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise TooManyRequestsError("https://sec.gov/x", retry_after=10**9)
+        return "ok"
+
+    assert client.run(op) == "ok"
+    assert sleeper.waits == [_MAX_COOLDOWN_SECONDS]  # a garbage header can't wedge the run
 
 
 def test_exhausted_retries_raise_domain_error_not_library_error():
@@ -159,13 +219,35 @@ def test_gate_rejects_missing_edgar_block():
     "overrides",
     [
         dict(user_agent_name="   "),  # blank name
+        dict(user_agent_name="fin-tin\nX-Injected: 1"),  # control char / header injection
         dict(contact_email="   "),  # blank email
         dict(contact_email="not-an-email"),  # malformed
-        dict(contact_email="you@example.com"),  # placeholder
-        dict(contact_email="your.email@example.com"),  # placeholder
+        dict(contact_email="you@example.com"),  # literal placeholder
+        dict(contact_email="your.email@example.com"),  # literal placeholder
+        dict(contact_email="admin@example.com"),  # reserved domain, not a literal placeholder
+        dict(contact_email="x@example.org"),  # reserved domain
+        dict(contact_email="x@foo.test"),  # reserved TLD
+        dict(contact_email="x@bar.invalid"),  # reserved TLD
     ],
 )
 def test_gate_rejects_bad_identity(overrides):
+    with pytest.raises(EdgarConfigError):
+        EdgarClient(_config(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        dict(cooldown_seconds=1),  # below the SEC 10-min floor
+        dict(max_throttle_retries=-1),  # negative
+        dict(rate_limit_per_sec=0.5),  # floors to 0 req/s
+        dict(rate_limit_per_sec=11),  # above SEC max
+    ],
+)
+def test_gate_rejects_unsafe_numeric_config(overrides):
+    """A directly-built EdgarConfig bypasses load_config's validation, so the
+    client must re-assert the ban-safety floors itself (defense in depth) —
+    before mutating any edgar global."""
     with pytest.raises(EdgarConfigError):
         EdgarClient(_config(**overrides))
 
@@ -176,8 +258,14 @@ def test_gate_rejects_bad_identity(overrides):
 def test_no_edgar_or_raw_http_imports_outside_edgar_adapter():
     root = Path(__file__).resolve().parent.parent / "fintin"
     edgar_adapter = root / "adapters" / "edgar"
-    banned_roots = {"edgar", "httpx", "requests"}
-    banned_full = {"urllib.request", "http.client"}
+    # Match on the top-level module so both `import urllib.request` and
+    # `from urllib import request` (and `from http import client`) are caught,
+    # not just a hand-listed pair. Covers edgartools + every raw network client.
+    # (Dynamic imports via importlib/__import__ are not caught — a documented gap.)
+    banned_roots = {
+        "edgar", "httpx", "requests",
+        "urllib", "http", "aiohttp", "urllib3", "socket", "ftplib",
+    }
     offenders: list[tuple[str, str]] = []
 
     for py in root.rglob("*.py"):
@@ -187,11 +275,10 @@ def test_no_edgar_or_raw_http_imports_outside_edgar_adapter():
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
-                    if alias.name.split(".")[0] in banned_roots or alias.name in banned_full:
+                    if alias.name.split(".")[0] in banned_roots:
                         offenders.append((str(py), alias.name))
             elif isinstance(node, ast.ImportFrom):
-                mod = node.module or ""
-                if mod.split(".")[0] in banned_roots or mod in banned_full:
-                    offenders.append((str(py), mod))
+                if (node.module or "").split(".")[0] in banned_roots:
+                    offenders.append((str(py), node.module or ""))
 
     assert not offenders, f"EDGAR/raw-HTTP imports outside adapters/edgar: {offenders}"

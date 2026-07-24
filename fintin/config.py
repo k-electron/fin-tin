@@ -46,7 +46,7 @@ class EdgarConfig:
 
     user_agent_name: str
     contact_email: str
-    rate_limit_per_sec: float = 10.0
+    rate_limit_per_sec: float = 9.0  # SEC max is 10; 9 leaves a safety margin (edgartools' own default)
     cooldown_seconds: int = 600
     max_throttle_retries: int = 3
 
@@ -150,15 +150,17 @@ def _parse_edgar(ed: dict, path: Path) -> EdgarConfig:
                 f"[edgar].{key} in {path} must be a string, got {ed[key]!r}."
             )
 
-    rate = ed.get("rate_limit_per_sec", 10.0)
+    rate = ed.get("rate_limit_per_sec", 9.0)
     # bool is a subclass of int/float — reject it before the numeric check.
     if isinstance(rate, bool) or not isinstance(rate, (int, float)):
         raise ConfigError(
             f"[edgar].rate_limit_per_sec in {path} must be a number, got {rate!r}."
         )
-    if not (0 < rate <= 10):
+    # edgartools' throttle is integer req/s; require >= 1 so the loader and the
+    # client agree (the client applies int(rate)). SEC max is 10.
+    if not (1 <= rate <= 10):
         raise ConfigError(
-            f"[edgar].rate_limit_per_sec in {path} must be in (0, 10] "
+            f"[edgar].rate_limit_per_sec in {path} must be in [1, 10] "
             f"(SEC max is 10 req/s), got {rate}."
         )
 

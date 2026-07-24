@@ -159,7 +159,7 @@ def test_edgar_defaults_applied(tmp_path):
         )
     )
     cfg = load_config(p)
-    assert cfg.edgar.rate_limit_per_sec == 10.0
+    assert cfg.edgar.rate_limit_per_sec == 9.0  # default leaves a margin below the SEC max
     assert cfg.edgar.cooldown_seconds == 600
     assert cfg.edgar.max_throttle_retries == 3
 

@@ -51,9 +51,9 @@ cp fintin.toml.example fintin.toml
   `contact_email` to **your real address** before running any EDGAR command. The
   EDGAR client refuses to start on a blank/placeholder email (it would otherwise
   send an "Undeclared Automated Tool" User-Agent and risk a ban). `rate_limit_per_sec`
-  is capped at the SEC max of 10 req/s (set lower for extra margin); on a throttle
-  breach the client honors `Retry-After` if present, else waits ≥ 10 minutes, then
-  retries.
+  is capped at the SEC max of 10 req/s and defaults to 9 for margin. On a throttle
+  breach the client waits **at least** the ≥ 10-minute cool-down — honoring a
+  *longer* `Retry-After` if the SEC sent one, never a shorter one — then retries.
 
 Never commit your real email — keep it only in your local `fintin.toml`. A
 missing or malformed config produces a clear error, not a stack trace.
