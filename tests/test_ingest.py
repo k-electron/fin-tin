@@ -133,20 +133,33 @@ def test_duration_fact_period_preserved():
 def test_content_hash_deterministic():
     kw = dict(
         cik=320193, accession="0000320193-24-000123", raw_tag="us-gaap:Revenues",
-        taxonomy="us-gaap", period_start=date(2023, 1, 1), period_end=date(2023, 12, 31),
-        unit="USD", value=1000.0, form="10-K", filed_date=date(2024, 2, 1),
+        taxonomy="us-gaap", raw_label="Revenues", period_start=date(2023, 1, 1),
+        period_end=date(2023, 12, 31), unit="USD", value=1000.0, form="10-K",
+        filed_date=date(2024, 2, 1),
     )
     assert content_hash(**kw) == content_hash(**kw)
 
 
-def test_content_hash_changes_with_value():
+def test_content_hash_changes_with_value_and_label():
     base = dict(
         cik=320193, accession="0000320193-24-000123", raw_tag="us-gaap:Revenues",
-        taxonomy="us-gaap", period_start=date(2023, 1, 1), period_end=date(2023, 12, 31),
-        unit="USD", value=1000.0, form="10-K", filed_date=date(2024, 2, 1),
+        taxonomy="us-gaap", raw_label="Revenues", period_start=date(2023, 1, 1),
+        period_end=date(2023, 12, 31), unit="USD", value=1000.0, form="10-K",
+        filed_date=date(2024, 2, 1),
     )
-    other = {**base, "value": 1000.01}
-    assert content_hash(**base) != content_hash(**other)
+    assert content_hash(**base) != content_hash(**{**base, "value": 1000.01})
+    assert content_hash(**base) != content_hash(**{**base, "raw_label": "Revenue"})
+
+
+def test_content_hash_injection_proof():
+    # A field value can't forge a collision by embedding a separator-like string.
+    a = dict(
+        cik=1, accession="0000000001-24-000001", raw_tag="us-gaap:A", taxonomy="us-gaap",
+        raw_label="x", period_start=date(2023, 1, 1), period_end=date(2023, 12, 31),
+        unit="USD", value=1.0, form="10-K", filed_date=date(2024, 2, 1),
+    )
+    b = {**a, "raw_tag": "us-gaap:A\x1fus-gaap", "taxonomy": ""}  # would collide under a raw join
+    assert content_hash(**a) != content_hash(**b)
 
 
 def test_normalize_accession():
@@ -201,13 +214,94 @@ def test_ingest_company_wires_fetch_transform_insert():
     assert captured["rows"][0].version == 42  # stamped ingest version
 
 
-def test_ingest_company_default_version_is_monotonic_ns():
-    def fake_fetch(cik):
-        return [_fact()]
+def test_ingest_company_stamps_supplied_version():
+    captured = {}
 
     def fake_insert(rows):
+        captured["rows"] = list(rows)
         return len(rows)
 
-    r1 = ingest_company(1, fetch_facts=fake_fetch, insert_rows=fake_insert, taxonomy_version=_TAXV)
-    r2 = ingest_company(1, fetch_facts=fake_fetch, insert_rows=fake_insert, taxonomy_version=_TAXV)
-    assert r1.rows_landed == r2.rows_landed == 1  # both runs land; version defaulted (time_ns)
+    result = ingest_company(
+        7, fetch_facts=lambda c: [_fact()], insert_rows=fake_insert,
+        taxonomy_version=_TAXV, version=555,
+    )
+    assert result.version == 555
+    assert captured["rows"][0].version == 555
+
+
+# --- review-round additions ----------------------------------------------------
+
+
+def test_non_finite_value_dropped():
+    rows, result = _rows([_fact(numeric_value=float("nan")), _fact(numeric_value=float("inf"))])
+    assert rows == [] and result.dropped_non_numeric == 2
+
+
+def test_duration_missing_start_dropped():
+    rows, result = _rows([_fact(period_type="duration", period_start=None)])
+    assert rows == [] and result.dropped_incomplete == 1
+
+
+def test_reversed_or_zero_length_duration_dropped():
+    rows, result = _rows(
+        [
+            _fact(period_start=date(2023, 12, 31), period_end=date(2023, 1, 1)),  # reversed
+            _fact(period_start=date(2023, 6, 30), period_end=date(2023, 6, 30)),  # zero-length duration
+        ]
+    )
+    assert rows == [] and result.dropped_incomplete == 2
+
+
+def test_noncanonical_accession_dropped():
+    rows, result = _rows(
+        [
+            _fact(accession="   "),  # whitespace — must NOT slip through as ""
+            _fact(accession="abc-def"),  # has a dash but wrong shape
+            _fact(accession="12345"),  # too short
+        ]
+    )
+    assert rows == [] and result.dropped_incomplete == 3
+
+
+def test_intra_batch_duplicate_identity_key_deduped_last_wins():
+    # Same (accession, raw_tag, period_start, period_end, unit), different value.
+    rows, result = _rows(
+        [
+            _fact(numeric_value=100.0, label="first"),
+            _fact(numeric_value=200.0, label="second"),
+        ]
+    )
+    assert result.rows_landed == 1 and result.deduped == 1
+    assert rows[0].value == 200.0  # last wins, deterministically
+
+
+def test_fixture_parse_transform_pins_value_scale():
+    """Parse a hand-crafted companyfacts JSON (offline) through edgartools'
+    parser and confirm the landed value is the ACTUAL 'val' — a guard against a
+    future edgartools change that starts applying `scale` (off-by-1000×)."""
+    from edgar.entity.parser import EntityFactsParser
+
+    cf = {
+        "cik": 320193,
+        "entityName": "TEST CO",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {"label": "Revenues", "units": {"USD": [
+                    {"start": "2023-01-01", "end": "2023-12-31", "val": 123456,
+                     "accn": "0000320193-24-000123", "fy": 2023, "fp": "FY",
+                     "form": "10-K", "filed": "2024-02-01"},
+                ]}},
+                "Assets": {"label": "Assets", "units": {"USD": [
+                    {"end": "2023-12-31", "val": 999, "accn": "0000320193-24-000123",
+                     "fy": 2023, "fp": "FY", "form": "10-K", "filed": "2024-02-01"},
+                ]}},
+            }
+        },
+    }
+    facts = EntityFactsParser.parse_company_facts(cf)
+    assert facts is not None
+    rows, result = _rows(facts)
+    assert result.rows_landed == 2
+    by_tag = {r.raw_tag: r for r in rows}
+    assert by_tag["us-gaap:Revenues"].value == 123456.0  # actual val, NOT scaled
+    assert by_tag["us-gaap:Assets"].period_start == by_tag["us-gaap:Assets"].period_end  # instant

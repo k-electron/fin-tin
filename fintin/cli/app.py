@@ -157,9 +157,23 @@ def ingest_company_command(
         EdgarConfigError,
         EdgarThrottleError,
     )
-    from fintin.adapters.edgar.facts import edgartools_version, fetch_company_facts
-    from fintin.adapters.store.raw_fact_repo import insert_raw_facts
+    from fintin.adapters.edgar.facts import (
+        NoCompanyFactsError,
+        edgartools_version,
+        fetch_company_facts,
+    )
+    from fintin.adapters.store.raw_fact_repo import insert_raw_facts, next_ingest_version
     from fintin.core.ingest import ingest_company
+
+    # Validate the CIK before any work — cik is UInt32 in raw_fact, and a bad
+    # value would otherwise waste an EDGAR fetch before failing at insert.
+    if not (1 <= cik <= 4_294_967_295):
+        typer.secho(
+            f"Invalid CIK {cik}: must be between 1 and 4294967295.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
 
     try:
         cfg = load_config(config)
@@ -189,12 +203,18 @@ def ingest_company_command(
     client = None
     try:
         client = get_client(cfg.clickhouse)
+        # Ingest-monotonic version from the store (AD-6), not a wall clock.
+        version = next_ingest_version(client)
         result = ingest_company(
             cik,
             fetch_facts=lambda c: fetch_company_facts(edgar_client, c),
             insert_rows=lambda rows: insert_raw_facts(client, rows),
             taxonomy_version=edgartools_version(),
+            version=version,
         )
+    except NoCompanyFactsError as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
     except EdgarThrottleError as exc:
         typer.secho(f"EDGAR throttled, gave up: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)

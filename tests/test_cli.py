@@ -87,3 +87,11 @@ def test_ingest_company_placeholder_email_reports_clean_error(tmp_path):
     assert result.exit_code == 2
     assert "EDGAR config error" in result.output
     assert "Traceback" not in result.output
+
+
+def test_ingest_company_invalid_cik_reports_clean_error():
+    # CIK 0 is out of the UInt32 range [1, ...]; must fail fast before any fetch.
+    result = runner.invoke(app, ["ingest-company", "0"])
+    assert result.exit_code == 2
+    assert "Invalid CIK" in result.output
+    assert "Traceback" not in result.output

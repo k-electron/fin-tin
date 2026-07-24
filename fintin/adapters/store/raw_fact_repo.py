@@ -37,3 +37,13 @@ def insert_raw_facts(client, rows: Sequence[RawFactRow]) -> int:
     data = [list(row) for row in rows]  # RawFactRow is a NamedTuple in column order
     client.insert("raw_fact", data, column_names=RAW_FACT_COLUMNS)
     return len(rows)
+
+
+def next_ingest_version(client) -> int:
+    """The next ingest-monotonic ``version`` (AD-6): one greater than the greatest
+    version currently in ``raw_fact`` (1 for an empty table). Sourcing the version
+    from the store — not a wall clock — guarantees a re-ingest always supersedes a
+    corrupted prior copy on read, regardless of clock changes."""
+    rows = client.query("SELECT max(version) FROM raw_fact").result_rows
+    current = rows[0][0] if rows and rows[0][0] is not None else 0
+    return int(current) + 1

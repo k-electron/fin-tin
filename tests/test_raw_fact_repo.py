@@ -12,11 +12,15 @@ import uuid
 from datetime import date
 
 import pytest
+from edgar.entity.models import FinancialFact
 
 from fintin.adapters.store import schema as store_schema
 from fintin.adapters.store.client import get_client
-from fintin.adapters.store.raw_fact_repo import insert_raw_facts
-from fintin.core.ingest import RawFactRow
+from fintin.adapters.store.raw_fact_repo import (
+    insert_raw_facts,
+    next_ingest_version,
+)
+from fintin.core.ingest import RawFactRow, to_raw_fact_rows
 
 
 @pytest.fixture
@@ -122,3 +126,51 @@ def test_corrected_reingest_higher_version_supersedes(schema_client):
     assert resolved() == 100.0  # higher version wins pre-merge
     schema_client.command("OPTIMIZE TABLE raw_fact FINAL")
     assert resolved() == 100.0  # ...and stays correct across a merge
+
+
+@pytest.mark.integration
+def test_next_ingest_version_is_monotonic(schema_client):
+    """AD-6: version comes from max(version)+1 in the store, so a re-ingest always
+    supersedes — independent of the wall clock."""
+    assert next_ingest_version(schema_client) == 1  # empty table
+    insert_raw_facts(schema_client, [_row(version=5, content_hash="a")])
+    assert next_ingest_version(schema_client) == 6
+    insert_raw_facts(schema_client, [_row(raw_tag="us-gaap:Assets", version=6, content_hash="b")])
+    assert next_ingest_version(schema_client) == 7
+
+
+@pytest.mark.integration
+def test_transform_to_insert_roundtrip(schema_client):
+    """End-to-end seam (offline): FinancialFact -> to_raw_fact_rows -> insert ->
+    read back via FINAL. Exercises real date/float round-tripping of transform
+    output through ClickHouse (not hand-built rows)."""
+    facts = [
+        FinancialFact(
+            concept="us-gaap:Revenues", taxonomy="us-gaap", label="Revenues",
+            value=123456.0, numeric_value=123456.0, unit="USD",
+            period_start=date(2023, 1, 1), period_end=date(2023, 12, 31),
+            period_type="duration", filing_date=date(2024, 2, 1),
+            form_type="10-K", accession="0000320193-24-000123",
+        ),
+        FinancialFact(
+            concept="us-gaap:Assets", taxonomy="us-gaap", label="Assets",
+            value=999.0, numeric_value=999.0, unit="USD",
+            period_start=None, period_end=date(2023, 12, 31),
+            period_type="instant", filing_date=date(2024, 2, 1),
+            form_type="10-K", accession="0000320193-24-000123",
+        ),
+    ]
+    version = next_ingest_version(schema_client)
+    rows, result = to_raw_fact_rows(facts, cik=320193, taxonomy_version="5.43.0", version=version)
+    assert insert_raw_facts(schema_client, rows) == result.rows_landed == 2
+
+    got = schema_client.query(
+        "SELECT raw_tag, value, period_start, period_end, filed_date, version "
+        "FROM raw_fact FINAL WHERE cik = 320193 ORDER BY raw_tag"
+    ).result_rows
+    assert len(got) == 2
+    assets, revenues = got
+    assert assets[0] == "us-gaap:Assets" and assets[2] == assets[3] == date(2023, 12, 31)  # instant
+    assert revenues[0] == "us-gaap:Revenues" and revenues[1] == 123456.0  # actual, unscaled
+    assert revenues[2] == date(2023, 1, 1) and revenues[3] == date(2023, 12, 31)  # duration
+    assert revenues[5] == version
