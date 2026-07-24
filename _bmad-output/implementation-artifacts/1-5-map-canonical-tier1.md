@@ -3,7 +3,7 @@ baseline_commit: f411adb111726141df6683909689b43de98ab2f4
 ---
 # Story 1.5: Map raw facts to canonical Tier 1 (standard-element concepts)
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -85,6 +85,18 @@ Code review of story-1.5 (2026-07-24). Blind Hunter (adversarial) completed; Edg
 - [x] [Review][Defer] `next_canonical_version` read-then-increment is not atomic [fintin/adapters/store/canonical_fact_repo.py] — deferred, single-writer v1 assumption (ties to AD-12 single-flight); recorded in deferred-work.md.
 - [x] [Review][Defer] Ambiguous / manual-mart-refresh items — the ambiguous-tag finding is moot post-pivot (no statistical mapping); the mart-view-refresh limitation remains (existing DB needs `schema-init` re-run), recorded in deferred-work.md.
 
+### Re-review findings (2026-07-24)
+
+Re-review of the reworked branch (`21c4dfa..HEAD`) — all three layers completed (Blind Hunter, Edge Case Hunter, Acceptance Auditor). The pivot verified sound: projection, provenance carry-over, zero-`edgar`, `multiIf` first-present semantics, injection-safety (current constant dict), and re-projection idempotency across `OPTIMIZE … FINAL` all confirmed. **0 decision-needed, 3 patch, 3 defer, 1 dismissed.**
+
+- [x] [Review][Patch] `_mart_column` emits invalid SQL for an empty element list (`multiIf(, NULL)`) — guard `not elements` → `CAST(NULL AS Nullable(Float64)) AS <alias>`. Unreachable with the current seed but the dictionary grows in Story 1.6. [fintin/adapters/store/schema.py]
+- [x] [Review][Patch] Element names are string-interpolated into mart DDL — validate each against `^[A-Za-z0-9]+$` before interpolation (defense for when Story 1.6 sources the dictionary from a non-literal). [fintin/adapters/store/schema.py]
+- [x] [Review][Patch] Zero-`edgar` AST guard covers only `core/canonical.py` — extend it to the map path's store repos (`canonical_fact_repo.py`, `raw_fact_repo.py`). (CLI `app.py` legitimately lazy-imports edgar in the *ingest* command, so a whole-module guard there isn't possible; the map command's import block is inspected.) [tests/test_canonical.py]
+- [x] [Review][Defer→1.6] First-present precedence is position-based, not recency-aware — the mart can return a stale (period restated under a different element in a newer filing) or subtotal value, because latest-filed `argMax` runs only *within* each element, not *across* the concept's element union. This is Story 1.6's core resolution work; **the 1.6 AC has been corrected** to require the latest-filed value across the element union with list-position as the deterministic tiebreak. The 1.5 seed mart's position-only limitation is documented in `schema.py`. [fintin/adapters/store/schema.py CONCEPT_DICTIONARY]
+- [x] [Review][Defer→1.6] `resolved_fact` MV groups by the namespace-stripped `canonical_concept`, so `us-gaap:X`/`dei:X`/`srt:X` would re-collapse there (the "raw_tag in the key" invariant holds for `canonical_fact`, not the MV). Latent (no dei/srt local-name twin among the shipped columns). Defer: add a namespace/raw_tag discriminator to the resolution key if dei/srt numeric facts ever enter a concept list. [fintin/adapters/store/schema.py:90-101]
+- [x] [Review][Defer] Projection does no taxonomy-scope / raw_tag-format re-validation (`local_name('us-gaap:')` → `''`) — relies on the Story 1.4 Tier-0 precondition (AC-2). Unreachable today; noted as a defense-in-depth gap in deferred-work.
+- Dismissed: first-present determinism "tested in one insertion order" — `multiIf` position-first is insertion-order-independent by construction; the deferred non-atomic `next_canonical_version` was already recorded.
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -118,3 +130,4 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 ## Change Log
 
 - 2026-07-24 — Story 1.5 implemented (edgartools standardization), reviewed, then **pivoted** (AD-9 correct-course): canonical concept = the standard element (1:1 lossless), cross-company comparability via a first-present concept dictionary in the mart. Removed `standardize.py`. 113 tests pass; verified live on Apple through the full mart. Status → review.
+- 2026-07-24 — Re-review of the reworked branch (3 layers, all clean). Applied 3 hardening patches: empty-element-list guard + element-name validation in `_mart_column`, and extended the zero-`edgar` AST guard to the store repos. Deferred the position-vs-recency and cross-namespace resolution findings to Story 1.6 (its 1.6 AC corrected to require recency-aware resolution). **118 tests pass.** Status → done.

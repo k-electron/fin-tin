@@ -31,6 +31,8 @@ Key invariants:
 
 from __future__ import annotations
 
+import re
+
 # Tier 0 — immutable raw landing (AD-6, AD-14, AD-15, AD-17)
 RAW_FACT = """
 CREATE TABLE IF NOT EXISTS raw_fact (
@@ -130,11 +132,24 @@ CONCEPT_DICTIONARY: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+# XBRL element local names are NCNames; the ones we map are alphanumeric. Validate
+# before interpolating into DDL so the concept dictionary can grow (Story 1.6, when
+# it may be sourced from a non-literal) without opening a DDL-injection surface.
+_ELEMENT_NAME_RE = re.compile(r"^[A-Za-z0-9]+$")
+
+
 def _mart_column(alias: str, elements: tuple[str, ...]) -> str:
-    """First-present `multiIf` column over an ordered element list (element names
-    are hardcoded XBRL identifiers — alphanumeric, no injection surface)."""
+    """First-present `multiIf` column over an ordered element list."""
+    if not elements:
+        # An empty list would otherwise emit `multiIf(, NULL)` — a syntax error that
+        # breaks schema-init. A concept with no elements resolves to NULL.
+        return f"CAST(NULL AS Nullable(Float64)) AS {alias}"
     branches: list[str] = []
     for el in elements:
+        if not _ELEMENT_NAME_RE.match(el):
+            raise ValueError(
+                f"Invalid concept-dictionary element {el!r}: must be alphanumeric."
+            )
         pred = f"canonical_concept = '{el}' AND unit = 'USD'"
         branches.append(f"countIf({pred}) > 0, argMaxMergeIf(value_state, {pred})")
     return f"multiIf({', '.join(branches)}, NULL) AS {alias}"

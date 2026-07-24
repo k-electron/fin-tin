@@ -10,6 +10,8 @@ import ast
 from datetime import date
 from pathlib import Path
 
+import pytest
+
 from fintin.core.canonical import (
     CanonicalFactRow,
     ProjectResult,
@@ -125,17 +127,31 @@ def test_empty_input_is_clean():
     assert rows == [] and result.raw_seen == 0 and result.projected == 0
 
 
-def test_core_canonical_has_no_edgar_import():
-    """AD-4/AD-9 layering: the pure core must not import `edgar` — the projection is
-    pure string logic, so Tier 1 derivation is network-free by construction."""
-    src = Path("fintin/core/canonical.py").read_text()
-    tree = ast.parse(src)
+def _module_imports(path: str) -> set[str]:
+    tree = ast.parse(Path(path).read_text())
     imported: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for n in node.names:
                 imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom):
-            if node.module:
-                imported.add(node.module.split(".")[0])
-    assert "edgar" not in imported
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            imported.add(node.module.split(".")[0])
+    return imported
+
+
+@pytest.mark.parametrize(
+    "module",
+    [
+        "fintin/core/canonical.py",
+        "fintin/adapters/store/canonical_fact_repo.py",
+        "fintin/adapters/store/raw_fact_repo.py",
+    ],
+)
+def test_map_path_modules_have_no_edgar_import(module):
+    """AC-1 zero-network: no module on the map-canonical path imports `edgar` — the
+    projection is pure string logic and the store repos touch only ClickHouse, so
+    Tier 1 derivation is network-free by construction. A regression adding an
+    `edgar` import to any of these fails CI. (The CLI `app.py` legitimately
+    lazy-imports edgar inside the *ingest* command, so it can't be whole-module
+    guarded; the map command's own import block is edgar-free by inspection.)"""
+    assert "edgar" not in _module_imports(module)
