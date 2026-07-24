@@ -108,9 +108,29 @@ cp fintin.toml.example fintin.toml
   is capped at the SEC max of 10 req/s and defaults to 9 for margin. On a throttle
   breach the client waits **at least** the ≥ 10-minute cool-down — honoring a
   *longer* `Retry-After` if the SEC sent one, never a shorter one — then retries.
+- **`[universe]`** — the screening Universe: a static list of `tickers` and/or
+  `ciks` (the S&P 500 in v1). Tickers and CIKs are **public data** (safe to keep
+  in the tracked example), unlike your contact email.
 
 Never commit your real email — keep it only in your local `fintin.toml`. A
 missing or malformed config produces a clear error, not a stack trace.
+
+### Define your Universe
+
+List the companies you want to screen under `[universe]`, then resolve and
+inspect the scope:
+
+```bash
+uv run fintin universe            # resolve & report scope + any gaps
+uv run fintin universe --show-ciks   # also print the resolved CIK list
+```
+
+Tickers resolve to CIKs **offline** via edgartools' bundled reference table — no
+EDGAR request and no contact email required. A ticker not in that table is
+reported as an **explained gap** (never silently dropped); resolve it by adding
+its numeric `cik` directly. The Universe is derived from config on every run
+(never stored), so **growing it is a config edit alone** — no code or schema
+change.
 
 ## Testing
 

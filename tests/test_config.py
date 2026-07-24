@@ -6,7 +6,7 @@ import textwrap
 
 import pytest
 
-from fintin.config import ConfigError, EdgarConfig, load_config
+from fintin.config import ConfigError, EdgarConfig, UniverseConfig, load_config
 
 _VALID = textwrap.dedent(
     """
@@ -184,6 +184,69 @@ def test_edgar_defaults_applied(tmp_path):
     ],
 )
 def test_edgar_structural_validation_rejects(tmp_path, block):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + "\n" + textwrap.dedent(block))
+    with pytest.raises(ConfigError):
+        load_config(p)
+
+
+# --- [universe] block (Story 2.1) ----------------------------------------------
+# Structure/types/ranges only. A well-formed but unknown ticker MUST load cleanly
+# (resolvability is decided at resolve time — it later surfaces as a gap, not a
+# load error). CIK range == UInt32 [1, 4294967295].
+
+
+def test_universe_absent_is_none(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID)
+    assert load_config(p).universe is None
+
+
+def test_universe_tickers_and_ciks_parse(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        _VALID
+        + '\n[universe]\ntickers = ["AAPL", "brk.b"]\nciks = [320193, 1652044]\n'
+    )
+    cfg = load_config(p)
+    assert isinstance(cfg.universe, UniverseConfig)
+    assert cfg.universe.tickers == ("AAPL", "brk.b")  # verbatim (normalized at resolve)
+    assert cfg.universe.ciks == (320193, 1652044)
+
+
+def test_universe_pure_ciks_parse(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + "\n[universe]\nciks = [320193]\n")
+    cfg = load_config(p)
+    assert cfg.universe.tickers == ()
+    assert cfg.universe.ciks == (320193,)
+
+
+def test_universe_pure_tickers_parse(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + '\n[universe]\ntickers = ["MSFT"]\n')
+    cfg = load_config(p)
+    assert cfg.universe.tickers == ("MSFT",)
+    assert cfg.universe.ciks == ()
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "[universe]\n",  # both lists empty/absent -> empty Universe
+        "[universe]\ntickers = []\nciks = []\n",  # explicitly empty
+        '[universe]\ntickers = "AAPL"\n',  # tickers not a list
+        "[universe]\nciks = 320193\n",  # ciks not a list
+        '[universe]\ntickers = [123]\n',  # non-string ticker
+        '[universe]\ntickers = [""]\n',  # blank ticker
+        '[universe]\ntickers = ["  "]\n',  # whitespace-only ticker
+        '[universe]\nciks = ["320193"]\n',  # ciks not integers
+        "[universe]\nciks = [true]\n",  # bool masquerading as int
+        "[universe]\nciks = [0]\n",  # below UInt32 range
+        "[universe]\nciks = [4294967296]\n",  # above UInt32 range
+    ],
+)
+def test_universe_structural_validation_rejects(tmp_path, block):
     p = tmp_path / "fintin.toml"
     p.write_text(_VALID + "\n" + textwrap.dedent(block))
     with pytest.raises(ConfigError):
