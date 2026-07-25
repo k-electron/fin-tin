@@ -6,9 +6,7 @@ these tests need no edgartools at all — proving the core stays edgar-free.
 
 from __future__ import annotations
 
-import ast
 from datetime import date
-from pathlib import Path
 
 import pytest
 
@@ -20,6 +18,7 @@ from fintin.core.canonical import (
     to_canonical_fact_rows,
 )
 from fintin.core.ingest import RawFactRow
+from tests.purity import assert_no_edgar_import
 
 _TAXV = "5.43.0"
 
@@ -127,18 +126,6 @@ def test_empty_input_is_clean():
     assert rows == [] and result.raw_seen == 0 and result.projected == 0
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 @pytest.mark.parametrize(
     "module",
     [
@@ -154,4 +141,4 @@ def test_map_path_modules_have_no_edgar_import(module):
     `edgar` import to any of these fails CI. (The CLI `app.py` legitimately
     lazy-imports edgar inside the *ingest* command, so it can't be whole-module
     guarded; the map command's own import block is edgar-free by inspection.)"""
-    assert "edgar" not in _module_imports(module)
+    assert_no_edgar_import(module)

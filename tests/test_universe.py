@@ -6,9 +6,6 @@ edgar-free and offline; an AST guard locks that purity in.
 
 from __future__ import annotations
 
-import ast
-from pathlib import Path
-
 import pytest
 
 from fintin.config import UniverseConfig
@@ -18,6 +15,7 @@ from fintin.core.universe import (
     normalize_ticker,
     resolve_universe,
 )
+from tests.purity import assert_module_is_pure
 
 
 def _fake_resolver(mapping: dict[str, int | None]):
@@ -147,20 +145,8 @@ def test_normalize_ticker(raw, expected):
     assert normalize_ticker(raw) == expected
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
-def test_core_universe_has_no_edgar_import():
-    """Purity guard: the core resolver never imports `edgar` — ticker resolution
+def test_core_universe_is_pure():
+    """Purity guard: the core resolver imports nothing impure — ticker resolution
     is an injected port, so core stays offline and unit-testable. A regression
-    adding an `edgar` import here fails CI."""
-    assert "edgar" not in _module_imports("fintin/core/universe.py")
+    adding `edgar` (or any other impure dependency) here fails CI."""
+    assert_module_is_pure("fintin/core/universe.py")

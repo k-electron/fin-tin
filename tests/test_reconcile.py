@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import ast
 from datetime import date
-from pathlib import Path
 
 from fintin.core.reconcile import (
     WorkItem,
@@ -12,6 +10,7 @@ from fintin.core.reconcile import (
     compute_work_list,
     resolve_window,
 )
+from tests.purity import assert_module_is_pure
 
 
 def _wi(accession: str, cik: int = 320193, form: str = "10-K", filed="2024-02-01"):
@@ -105,22 +104,7 @@ def test_empty_candidates_is_clean():
 # --- purity guard --------------------------------------------------------------
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 def test_core_reconcile_is_pure():
-    """The reconciler imports no `edgar`, ClickHouse, or `pyarrow` — the adapters
-    produce its inputs; core only windows and diffs."""
-    imports = _module_imports("fintin/core/reconcile.py")
-    assert "edgar" not in imports
-    assert "clickhouse_connect" not in imports
-    assert "pyarrow" not in imports
+    """The reconciler imports nothing impure — the adapters produce its inputs;
+    core only windows and diffs."""
+    assert_module_is_pure("fintin/core/reconcile.py")

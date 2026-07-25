@@ -5,15 +5,14 @@ no ClickHouse (NFR-7 trivially).
 
 from __future__ import annotations
 
-import ast
 import os
 import time
-from pathlib import Path
 
 import pytest
 
 from fintin.adapters.lease.file_lease import FileLease
 from fintin.core.lease import run_single_flight
+from tests.purity import assert_module_is_pure
 
 
 # --- FileLease: acquire / coalesce / reclaim / heartbeat / release --------------
@@ -167,23 +166,8 @@ def test_run_single_flight_releases_even_when_run_raises():
 # --- purity guard ---------------------------------------------------------------
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 def test_core_lease_is_pure():
-    """The lease port + combinator import no `edgar`, ClickHouse, or `pyarrow` (and
-    no filesystem) — the concrete filesystem lease is the adapter's job."""
-    imports = _module_imports("fintin/core/lease.py")
-    assert "edgar" not in imports
-    assert "clickhouse_connect" not in imports
-    assert "pyarrow" not in imports
-    assert "os" not in imports  # no filesystem in the pure port
+    """The lease port + combinator import nothing impure — not even `os`, since the
+    concrete filesystem lease is the adapter's job. (`os` is absent from the pure
+    allowlist, so the no-filesystem half of this guard is now automatic.)"""
+    assert_module_is_pure("fintin/core/lease.py")

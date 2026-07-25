@@ -8,10 +8,8 @@ stubs must pass its filters.
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 
 import pytest
 
@@ -22,6 +20,7 @@ from fintin.core.backfill import (
     BackfillReport,
     backfill_universe,
 )
+from tests.purity import assert_module_is_pure
 
 
 @dataclass
@@ -388,22 +387,7 @@ def test_empty_universe_is_clean():
 # --- purity guard --------------------------------------------------------------
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 def test_core_backfill_is_pure():
-    """The engine imports no `edgar`, ClickHouse, or `pyarrow` — the strategy
-    fetches and the store inserts via injected ports; core only orchestrates."""
-    imports = _module_imports("fintin/core/backfill.py")
-    assert "edgar" not in imports
-    assert "clickhouse_connect" not in imports
-    assert "pyarrow" not in imports
+    """The engine imports nothing impure — the strategy fetches and the store
+    inserts via injected ports; core only orchestrates."""
+    assert_module_is_pure("fintin/core/backfill.py")
