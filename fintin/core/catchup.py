@@ -16,10 +16,12 @@ Status vocabulary (architecture brief §4 — all exit-0; the trigger interprets
 outcome, the engine emits it):
   * ``NOTHING_TO_DO`` — empty work list; **no `companyfacts` request**.
   * ``STARTED`` → ``COMPLETED`` — a non-empty run began and finished.
-``ALREADY_RUNNING`` (the single-flight self-expiring lease, AD-12) is **Story 3.2**
-— this engine has no lease; 3.2 wraps it. A throttle or systemic abort is NOT in
-this vocabulary: it propagates out (via ``fatal_errors`` / ``BackfillAborted``) so
-the CLI exits non-zero — ban-safety (SM-C1) outranks reporting a success.
+  * ``ALREADY_RUNNING`` — a live run already holds the single-flight lease
+    (AD-12); this trigger coalesces and does nothing (Story 3.2, via
+    :func:`catch_up_single_flight`), issuing **no** EDGAR request.
+A throttle or systemic abort is NOT in this vocabulary: it propagates out (via
+``fatal_errors`` / ``BackfillAborted``) so the CLI exits non-zero — ban-safety
+(SM-C1) outranks reporting a success.
 """
 
 from __future__ import annotations
@@ -36,6 +38,7 @@ from fintin.core.backfill import (
     backfill_universe,
 )
 from fintin.core.ingest import RawFactRow
+from fintin.core.lease import Lease, run_single_flight
 from fintin.core.reconcile import WorkList
 
 
@@ -43,10 +46,10 @@ class CatchUpStatus(enum.Enum):
     """The run-outcome vocabulary (all exit-0 at the CLI); rendered via ``.value``.
 
     A plain :class:`enum.Enum` (not ``str``-mixed) so ``str()``/f-string rendering
-    is stable across Python versions. Story 3.2 adds ``ALREADY_RUNNING`` (the
-    single-flight lease) as one more member."""
+    is stable across Python versions."""
 
     STARTED = "STARTED"
+    ALREADY_RUNNING = "ALREADY_RUNNING"
     NOTHING_TO_DO = "NOTHING_TO_DO"
     COMPLETED = "COMPLETED"
 
@@ -153,3 +156,24 @@ def catch_up(
         companies=len(affected),
         backfill=report,
     )
+
+
+def catch_up_single_flight(
+    lease: Lease, run: Callable[[], CatchUpReport]
+) -> CatchUpReport:
+    """Run a catch-up under the single-flight ``lease`` (AD-12). ``run`` does the
+    discovery + :func:`catch_up` (the CLI wires it). If a live run already holds
+    the lease, coalesce: return a terminal ``ALREADY_RUNNING`` report **without
+    invoking ``run``** — so the coalesced trigger issues no EDGAR request (AC-1).
+    Otherwise the lease is acquired (or an expired one reclaimed), ``run`` runs,
+    and the lease is released."""
+    result = run_single_flight(lease, run)
+    if result is None:
+        return CatchUpReport(
+            status=CatchUpStatus.ALREADY_RUNNING,
+            scanned=0,
+            outstanding=0,
+            companies=0,
+            backfill=None,
+        )
+    return result

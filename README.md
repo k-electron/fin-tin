@@ -220,8 +220,28 @@ Like backfill it **hits EDGAR and needs a real contact email**.
   than continuing — ban-safety outranks finishing.
 
 Catch-up derives its work fresh from the store + EDGAR's index every run — no cursor
-or "last run" marker (a crash just resumes on the next trigger). Guarding two
-concurrent catch-ups with a single-flight lease is a later story.
+or "last run" marker (a crash just resumes on the next trigger).
+
+### Single-flight (one run at a time)
+
+`backfill` and `catch-up` are both EDGAR-heavy — running two at once would double
+the request rate toward a ban. They share a **single-flight self-expiring lease**
+(a local lock file, `[lease].path`, default `fintin.lease`; **not** ClickHouse), so
+at most one runs at a time:
+
+- A trigger arriving while another run is active returns **`ALREADY_RUNNING`
+  (exit-0)** and issues **no EDGAR request** — it coalesces, it doesn't queue. Safe
+  to wire to a scheduler or a "catch up before I query" button.
+- The lease **self-expires**: a run refreshes it every `heartbeat_seconds`, and it's
+  considered dead `ttl_seconds` after the last heartbeat. So a crashed run never
+  deadlocks the tool — the next trigger reclaims the stale lease and resumes the
+  (DB-derived) remaining work.
+- A run paused in an EDGAR **cool-down** keeps heartbeating (a background thread), so
+  its lease is not reclaimed while it waits out a throttle.
+
+The lease file holds only `{token, pid, host, timestamps, ttl}` — no secrets — and
+is runtime state (gitignored). Tune `path` / `ttl_seconds` / `heartbeat_seconds` under `[lease]`
+in `fintin.toml` (heartbeat must be ≤ half the TTL).
 
 ### Check coverage & status
 

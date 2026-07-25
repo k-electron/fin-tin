@@ -566,7 +566,9 @@ def backfill_command(
         next_ingest_version,
         present_ciks,
     )
+    from fintin.adapters.lease.file_lease import FileLease
     from fintin.core.backfill import BackfillAborted, backfill_universe
+    from fintin.core.lease import run_single_flight
     from fintin.core.universe import resolve_universe
 
     try:
@@ -620,26 +622,44 @@ def backfill_command(
             "[%d/%d] CIK %s %s", event.index, event.total, event.cik, event.outcome
         )
 
-    client = None
-    try:
+    def _run():
+        # Everything EDGAR-touching lives here so the single-flight guard can gate
+        # it: a coalesced trigger never invokes _run, so it issues no EDGAR request.
         client = get_client(cfg.clickhouse)
-        # One ingest-monotonic version base per run (AD-6); the engine offsets it
-        # per company so a shared cross-company accession resolves deterministically.
-        version = next_ingest_version(client)
-        # Resume: skip companies already present (derived from the store, not a
-        # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
-        present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
-        report = backfill_universe(
-            resolved.ciks,
-            strategy=CompanyFactsStrategy(edgar_client),
-            insert_rows=lambda rows: insert_raw_facts(client, rows),
-            taxonomy_version=edgartools_version(),
-            version=version,
-            already_present=present,
-            fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
-            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
-            on_company=_log_company,
-        )
+        try:
+            # One ingest-monotonic version base per run (AD-6); the engine offsets
+            # it per company so a shared cross-company accession resolves
+            # deterministically.
+            version = next_ingest_version(client)
+            # Resume: skip companies already present (derived from the store, not a
+            # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
+            present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
+            return backfill_universe(
+                resolved.ciks,
+                strategy=CompanyFactsStrategy(edgar_client),
+                insert_rows=lambda rows: insert_raw_facts(client, rows),
+                taxonomy_version=edgartools_version(),
+                version=version,
+                already_present=present,
+                fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
+                max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
+                on_company=_log_company,
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    # Single-flight (AD-12): backfill shares the one lease with catch-up, so at most
+    # one ingestion run touches EDGAR at a time (a backfill + catch-up together would
+    # double the rate — a ban). A live run holding the lease → ALREADY_RUNNING with
+    # no EDGAR request; a crashed run's lease self-expires and is reclaimed here.
+    lease = FileLease(
+        cfg.lease.path,
+        ttl_seconds=cfg.lease.ttl_seconds,
+        heartbeat_seconds=cfg.lease.heartbeat_seconds,
+    )
+    try:
+        report = run_single_flight(lease, _run)
     except EdgarThrottleError as exc:
         typer.secho(
             f"EDGAR throttled, backfill aborted: {exc}", fg=typer.colors.RED, err=True
@@ -651,10 +671,15 @@ def backfill_command(
     except Exception as exc:  # setup/query error (connection already verified)
         typer.secho(f"Backfill failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                client.close()
+
+    # A live run already holds the shared lease → coalesce (ALREADY_RUNNING, exit 0).
+    if report is None:
+        typer.secho(
+            "Another run is already active — ALREADY_RUNNING "
+            "(nothing to do; no EDGAR request issued).",
+            fg=typer.colors.GREEN,
+        )
+        return
 
     noun = "company" if report.companies_ingested == 1 else "companies"
     typer.secho(
@@ -717,8 +742,9 @@ def catch_up_command(
         next_ingest_version,
         present_accessions,
     )
+    from fintin.adapters.lease.file_lease import FileLease
     from fintin.core.backfill import BackfillAborted, BackfillEvent
-    from fintin.core.catchup import CatchUpStatus, catch_up
+    from fintin.core.catchup import CatchUpStatus, catch_up, catch_up_single_flight
     from fintin.core.reconcile import compute_work_list, resolve_window
     from fintin.core.universe import resolve_universe
 
@@ -776,39 +802,55 @@ def catch_up_command(
     def _log_status(status: CatchUpStatus) -> None:
         logger.info("catch-up: %s", status.value)
 
-    client = None
-    try:
+    def _run():
+        # Everything EDGAR-touching lives here so the single-flight guard can gate
+        # it: a coalesced trigger never invokes _run, so it issues no EDGAR request.
         client = get_client(cfg.clickhouse)
-        # Discovery — the exact work-list pipeline (Epic 2 reconciler, REUSED):
-        # HWM sizes the index scan window (a hint, AD-16); membership by exact
-        # accession is the authority.
-        hwm = high_water_mark(client)
-        window_start, window_end = resolve_window(
-            hwm, cfg.reconcile.lookback_days, date.today()
-        )
-        candidates = fetch_work_candidates(
-            edgar_client,
-            filing_date=f"{window_start.isoformat()}:{window_end.isoformat()}",
-            ciks=resolved.ciks,
-        )
-        present = present_accessions(
-            client, accessions={c.accession for c in candidates}
-        )
-        work = compute_work_list(candidates, present)
-        # One ingest-monotonic version base per run (AD-6); the engine offsets it
-        # per affected company.
-        version = next_ingest_version(client)
-        report = catch_up(
-            work,
-            strategy=CompanyFactsStrategy(edgar_client),
-            insert_rows=lambda rows: insert_raw_facts(client, rows),
-            taxonomy_version=edgartools_version(),
-            version=version,
-            fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
-            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
-            on_company=_log_company,
-            on_status=_log_status,
-        )
+        try:
+            # Discovery — the exact work-list pipeline (Epic 2 reconciler, REUSED):
+            # HWM sizes the index scan window (a hint, AD-16); membership by exact
+            # accession is the authority.
+            hwm = high_water_mark(client)
+            window_start, window_end = resolve_window(
+                hwm, cfg.reconcile.lookback_days, date.today()
+            )
+            candidates = fetch_work_candidates(
+                edgar_client,
+                filing_date=f"{window_start.isoformat()}:{window_end.isoformat()}",
+                ciks=resolved.ciks,
+            )
+            present = present_accessions(
+                client, accessions={c.accession for c in candidates}
+            )
+            work = compute_work_list(candidates, present)
+            # One ingest-monotonic version base per run (AD-6); the engine offsets
+            # it per affected company.
+            version = next_ingest_version(client)
+            return catch_up(
+                work,
+                strategy=CompanyFactsStrategy(edgar_client),
+                insert_rows=lambda rows: insert_raw_facts(client, rows),
+                taxonomy_version=edgartools_version(),
+                version=version,
+                fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
+                max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
+                on_company=_log_company,
+                on_status=_log_status,
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    # Single-flight (AD-12): a live run already holding the lease → ALREADY_RUNNING
+    # WITHOUT running _run, so no EDGAR request is issued. A crashed run's lease
+    # self-expires and is reclaimed here; the reclaimed run re-derives the gap.
+    lease = FileLease(
+        cfg.lease.path,
+        ttl_seconds=cfg.lease.ttl_seconds,
+        heartbeat_seconds=cfg.lease.heartbeat_seconds,
+    )
+    try:
+        report = catch_up_single_flight(lease, _run)
     except EdgarThrottleError as exc:
         typer.secho(
             f"EDGAR throttled, catch-up aborted: {exc}", fg=typer.colors.RED, err=True
@@ -820,10 +862,15 @@ def catch_up_command(
     except Exception as exc:  # discovery/ingest error (connection already verified)
         typer.secho(f"Catch-up failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
-    finally:
-        if client is not None:
-            with contextlib.suppress(Exception):
-                client.close()
+
+    # ALREADY_RUNNING is a success outcome (exit 0) — another run holds the lease.
+    if report.status is CatchUpStatus.ALREADY_RUNNING:
+        typer.secho(
+            "Another run is already active — ALREADY_RUNNING "
+            "(nothing to do; no EDGAR request issued).",
+            fg=typer.colors.GREEN,
+        )
+        return
 
     # NOTHING_TO_DO is a success outcome (exit 0) — the store is already current.
     if report.status is CatchUpStatus.NOTHING_TO_DO:

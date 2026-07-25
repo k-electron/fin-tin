@@ -91,6 +91,32 @@ class ReconcileConfig:
     lookback_days: int = DEFAULT_LOOKBACK_DAYS
 
 
+# Single-flight lease defaults (AD-12). The lease is a FILESYSTEM lock file (not
+# ClickHouse); `path` is relative to the CWD by default. TTL is how long after the
+# last heartbeat the lease is considered expired (a crashed run self-expires);
+# heartbeat is how often a live run refreshes it — kept well below the TTL.
+DEFAULT_LEASE_PATH = "fintin.lease"
+DEFAULT_LEASE_TTL_SECONDS = 120
+DEFAULT_LEASE_HEARTBEAT_SECONDS = 15
+# Upper bound on the TTL — beyond this a crashed run's lease would outlive any sane
+# recovery window and silently defeat the self-expiry guarantee (a fat-fingered
+# ttl_seconds must not deadlock the tool for days).
+MAX_LEASE_TTL_SECONDS = 86400  # 24h
+
+
+@dataclass(frozen=True)
+class LeaseConfig:
+    """Single-flight self-expiring lease (AD-12, FR-11). A trigger arriving during
+    an active (heartbeating) run coalesces to ``ALREADY_RUNNING``; a crashed run's
+    lease expires after ``ttl_seconds`` past its last heartbeat and is reclaimed.
+    ``heartbeat_seconds`` must be ≪ ``ttl_seconds`` (enforced: ≥2 beats per TTL) so
+    a live run — even one blocked in an EDGAR cool-down — is never reclaimed."""
+
+    path: str = DEFAULT_LEASE_PATH
+    ttl_seconds: int = DEFAULT_LEASE_TTL_SECONDS
+    heartbeat_seconds: int = DEFAULT_LEASE_HEARTBEAT_SECONDS
+
+
 @dataclass(frozen=True)
 class Config:
     clickhouse: ClickHouseConfig
@@ -99,6 +125,9 @@ class Config:
     # Always populated (default when the [reconcile] section is absent) so the
     # reconciler always has a lookback value.
     reconcile: ReconcileConfig = ReconcileConfig()
+    # Always populated (default when the [lease] section is absent) so single-flight
+    # is on by default with a safe path/TTL/heartbeat.
+    lease: LeaseConfig = LeaseConfig()
 
 
 def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
@@ -148,11 +177,19 @@ def load_config(path: Path | str = DEFAULT_CONFIG_PATH) -> Config:
             raise ConfigError(f"[reconcile] in {path} must be a table/section.")
         reconcile = _parse_reconcile(rc, path)
 
+    ls = data.get("lease")
+    lease = LeaseConfig()
+    if ls is not None:
+        if not isinstance(ls, dict):
+            raise ConfigError(f"[lease] in {path} must be a table/section.")
+        lease = _parse_lease(ls, path)
+
     return Config(
         clickhouse=_parse_clickhouse(ch, path),
         edgar=edgar,
         universe=universe,
         reconcile=reconcile,
+        lease=lease,
     )
 
 
@@ -315,3 +352,49 @@ def _parse_reconcile(rc: dict, path: Path) -> ReconcileConfig:
             f"backfill horizon), got {lookback}."
         )
     return ReconcileConfig(lookback_days=lookback)
+
+
+def _parse_lease(ls: dict, path: Path) -> LeaseConfig:
+    # Structure/type/range only. The lease is a filesystem file; the adapter
+    # creates its parent dir at acquire time, so any writable path is valid here.
+    lease_path = ls.get("path", DEFAULT_LEASE_PATH)
+    if not isinstance(lease_path, str) or not lease_path.strip():
+        raise ConfigError(
+            f"[lease].path in {path} must be a non-empty string, got {lease_path!r}."
+        )
+
+    ttl = ls.get("ttl_seconds", DEFAULT_LEASE_TTL_SECONDS)
+    # bool subclasses int — reject it before the int/range check.
+    if isinstance(ttl, bool) or not isinstance(ttl, int):
+        raise ConfigError(
+            f"[lease].ttl_seconds in {path} must be an integer, got {ttl!r}."
+        )
+    if not (2 <= ttl <= MAX_LEASE_TTL_SECONDS):
+        raise ConfigError(
+            f"[lease].ttl_seconds in {path} must be between 2 and "
+            f"{MAX_LEASE_TTL_SECONDS} (>=2 for room for two heartbeats; a huge TTL "
+            f"would defeat self-expiry), got {ttl}."
+        )
+
+    heartbeat = ls.get("heartbeat_seconds", DEFAULT_LEASE_HEARTBEAT_SECONDS)
+    if isinstance(heartbeat, bool) or not isinstance(heartbeat, int):
+        raise ConfigError(
+            f"[lease].heartbeat_seconds in {path} must be an integer, got {heartbeat!r}."
+        )
+    if heartbeat < 1:
+        raise ConfigError(
+            f"[lease].heartbeat_seconds in {path} must be >= 1, got {heartbeat}."
+        )
+    # Heartbeat must be well below the TTL (>=2 beats per TTL window) so a live
+    # run — even one paused briefly (GC, cool-down) — is never falsely reclaimed.
+    if 2 * heartbeat > ttl:
+        raise ConfigError(
+            f"[lease].heartbeat_seconds ({heartbeat}) must be <= half of "
+            f"ttl_seconds ({ttl}) in {path} (heartbeat must be << TTL)."
+        )
+
+    return LeaseConfig(
+        path=lease_path,
+        ttl_seconds=ttl,
+        heartbeat_seconds=heartbeat,
+    )
