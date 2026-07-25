@@ -384,6 +384,148 @@ def test_empty_universe_is_clean():
     assert batches == []
 
 
+# --- inline Tier 1 projection ---------------------------------------------------
+# `project_company` derives Tier 1 right after each company's Tier 0 commit, so an
+# ingestion run leaves the store queryable instead of Tier-0-only.
+
+
+def _recording_project(fail=()):
+    """A fake `project_company` port recording (cik, position); raises for `fail`."""
+    from fintin.core.canonical import ProjectResult
+
+    calls: list[tuple[int, int]] = []
+
+    def _project(cik, position):
+        calls.append((cik, position))
+        if cik in set(fail):
+            raise RuntimeError(f"projection failed for {cik}")
+        return ProjectResult(cik=cik, raw_seen=7, projected=7, version=100 + position)
+
+    return _project, calls
+
+
+def test_projects_each_company_after_its_tier0_commit():
+    ciks = [1, 2]
+    strat = _FakeStrategy(facts_by_cik={c: _facts(c) for c in ciks})
+    insert, _, _ = _capturing_insert()
+    project, calls = _recording_project()
+
+    report = backfill_universe(
+        ciks,
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        project_company=project,
+    )
+
+    # Projected once per ingested company, with the engine's per-company position
+    # so the caller can offset a canonical version base deterministically.
+    assert calls == [(1, 0), (2, 1)]
+    assert report.companies_projected == 2
+    assert report.canonical_rows_landed == 14
+    assert report.companies_failed == 0
+
+
+def test_skipped_company_is_not_projected():
+    """A resume skip fetches nothing, so there is nothing new to project."""
+    strat = _FakeStrategy(facts_by_cik={2: _facts(2)})
+    insert, _, _ = _capturing_insert()
+    project, calls = _recording_project()
+
+    backfill_universe(
+        [1, 2],
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        already_present={1},
+        project_company=project,
+    )
+
+    assert calls == [(2, 1)]
+
+
+def test_projection_failure_is_a_recorded_gap_naming_the_tier_split():
+    """Tier 0 is already committed when projection fails, so the company is left
+    tier-split. It must be a recorded failure (not an ingest), and the reason must
+    say so — the run did not leave it queryable."""
+    ciks = [1, 2]
+    strat = _FakeStrategy(facts_by_cik={c: _facts(c) for c in ciks})
+    insert, _, _ = _capturing_insert()
+    project, _ = _recording_project(fail=(1,))
+
+    report = backfill_universe(
+        ciks,
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        project_company=project,
+    )
+
+    assert report.companies_failed == 1
+    assert report.companies_ingested == 1  # only CIK 2 fully succeeded
+    (failure,) = report.failures
+    assert failure.cik == 1
+    assert "Tier 0 landed" in failure.reason and "not yet queryable" in failure.reason
+    # The run continued to the next company (SM-2), and CIK 1 is not counted as
+    # ingested — so the both-tier resume test will retry it rather than skip it.
+    assert [r.cik for r in report.ingested] == [2]
+
+
+def test_projection_failures_count_toward_the_systemic_abort():
+    """A store that dies mid-run fails projections, not fetches — that must still
+    trip the consecutive-failure abort rather than burn EDGAR requests."""
+    ciks = [1, 2, 3]
+    strat = _FakeStrategy(facts_by_cik={c: _facts(c) for c in ciks})
+    insert, _, _ = _capturing_insert()
+    project, _ = _recording_project(fail=(1, 2, 3))
+
+    with pytest.raises(BackfillAborted):
+        backfill_universe(
+            ciks,
+            strategy=strat,
+            insert_rows=insert,
+            taxonomy_version="v",
+            version=1,
+            max_consecutive_failures=2,
+            project_company=project,
+        )
+
+
+def test_fatal_error_from_projection_propagates():
+    """A fatal_errors type raised while projecting aborts the run, same as a fetch."""
+
+    def _project(cik, position):
+        raise _Throttle("store throttled")
+
+    strat = _FakeStrategy(facts_by_cik={1: _facts(1)})
+    insert, _, _ = _capturing_insert()
+
+    with pytest.raises(_Throttle):
+        backfill_universe(
+            [1],
+            strategy=strat,
+            insert_rows=insert,
+            taxonomy_version="v",
+            version=1,
+            fatal_errors=(_Throttle,),
+            project_company=_project,
+        )
+
+
+def test_without_the_port_the_run_stays_tier0_only():
+    """Omitting `project_company` preserves the original Tier-0-only behavior."""
+    strat = _FakeStrategy(facts_by_cik={1: _facts(1)})
+    insert, _, _ = _capturing_insert()
+    report = backfill_universe(
+        [1], strategy=strat, insert_rows=insert, taxonomy_version="v", version=1
+    )
+    assert report.projections == ()
+    assert report.canonical_rows_landed == 0
+
+
 # --- purity guard --------------------------------------------------------------
 
 

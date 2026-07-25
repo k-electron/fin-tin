@@ -596,7 +596,14 @@ def backfill_command(
         present_ciks,
     )
     from fintin.adapters.lease.file_lease import FileLease
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        mapped_ciks,
+        next_canonical_version,
+    )
+    from fintin.adapters.store.raw_fact_repo import read_raw_facts
     from fintin.core.backfill import BackfillAborted, backfill_universe
+    from fintin.core.canonical import map_company
     from fintin.core.lease import run_single_flight
     from fintin.core.universe import resolve_universe
 
@@ -659,9 +666,22 @@ def backfill_command(
             # it per company so a shared cross-company accession resolves
             # deterministically.
             version = next_ingest_version(client)
-            # Resume: skip companies already present (derived from the store, not a
-            # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
-            present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
+            # One canonical version base per run too (Tier 1 has its own monotonic
+            # sequence, AD-6); the engine's per-company position offsets it exactly
+            # as it offsets the raw version, so both tiers stay deterministic.
+            canonical_base = next_canonical_version(client)
+            # Resume: skip companies already DONE — present in BOTH tiers. Tier 0
+            # alone would skip a company whose projection failed, leaving it
+            # permanently unqueryable (derived from the store, not a checkpoint —
+            # AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
+            present = (
+                set()
+                if refresh
+                else (
+                    present_ciks(client, ciks=resolved.ciks)
+                    & mapped_ciks(client, ciks=resolved.ciks)
+                )
+            )
             return backfill_universe(
                 resolved.ciks,
                 strategy=CompanyFactsStrategy(edgar_client),
@@ -672,6 +692,14 @@ def backfill_command(
                 fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
                 max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
                 on_company=_log_company,
+                # Derive Tier 1 per company, so the run leaves the store queryable
+                # (mart included) instead of Tier-0-only.
+                project_company=lambda c, position: map_company(
+                    c,
+                    read_raw_facts=lambda x: read_raw_facts(client, x),
+                    insert_rows=lambda rows: insert_canonical_facts(client, rows),
+                    version=canonical_base + position,
+                ),
             )
         finally:
             with contextlib.suppress(Exception):
@@ -711,7 +739,8 @@ def backfill_command(
     noun = "company" if report.companies_ingested == 1 else "companies"
     typer.secho(
         f"Backfill complete: {report.companies_ingested} {noun} ingested "
-        f"({report.rows_landed} facts landed), "
+        f"({report.rows_landed} facts landed, "
+        f"{report.canonical_rows_landed} projected to canonical Tier 1), "
         f"{report.companies_skipped} already present, "
         f"{report.companies_failed} failed "
         f"into database '{cfg.clickhouse.database}'.",
@@ -768,9 +797,15 @@ def catch_up_command(
         insert_raw_facts,
         next_ingest_version,
         present_accessions,
+        read_raw_facts,
     )
     from fintin.adapters.lease.file_lease import FileLease
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        next_canonical_version,
+    )
     from fintin.core.backfill import BackfillAborted, BackfillEvent
+    from fintin.core.canonical import map_company
     from fintin.core.catchup import CatchUpStatus, catch_up, catch_up_single_flight
     from fintin.core.reconcile import compute_work_list, resolve_window
     from fintin.core.universe import resolve_universe
@@ -852,6 +887,7 @@ def catch_up_command(
             # One ingest-monotonic version base per run (AD-6); the engine offsets
             # it per affected company.
             version = next_ingest_version(client)
+            canonical_base = next_canonical_version(client)
             return catch_up(
                 work,
                 strategy=CompanyFactsStrategy(edgar_client),
@@ -862,6 +898,14 @@ def catch_up_command(
                 max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
                 on_company=_log_company,
                 on_status=_log_status,
+                # Re-derive Tier 1 for each affected company, so a newly-filed or
+                # restated report is queryable the moment catch-up finishes.
+                project_company=lambda c, position: map_company(
+                    c,
+                    read_raw_facts=lambda x: read_raw_facts(client, x),
+                    insert_rows=lambda rows: insert_canonical_facts(client, rows),
+                    version=canonical_base + position,
+                ),
             )
         finally:
             with contextlib.suppress(Exception):
