@@ -312,6 +312,66 @@ def test_on_status_exception_does_not_sink_the_run():
     assert report.companies_ingested == 1
 
 
+# --- single-flight: catch_up_single_flight (AC-4, AC-7, Story 3.2) --------------
+
+
+class _FakeLease:
+    def __init__(self, acquired: bool):
+        self._acquired = acquired
+        self.released = False
+
+    def acquire(self) -> bool:
+        return self._acquired
+
+    def release(self) -> None:
+        self.released = True
+
+
+def test_single_flight_coalesces_to_already_running_without_running():
+    from fintin.core.catchup import catch_up_single_flight
+
+    lease = _FakeLease(acquired=False)  # a live run already holds it
+    calls: list[int] = []
+
+    def _run() -> CatchUpReport:
+        calls.append(1)
+        return catch_up(  # would run discovery + ingest — must NOT be reached
+            _work(_item(1)),
+            strategy=_FakeStrategy(facts_by_cik={1: _facts(1)}),
+            insert_rows=_capturing_insert()[0],
+            taxonomy_version="v",
+            version=1,
+        )
+
+    report = catch_up_single_flight(lease, _run)
+    assert report.status is CatchUpStatus.ALREADY_RUNNING
+    assert report.backfill is None
+    assert report.companies == 0
+    assert calls == []  # _run (discovery + EDGAR) never invoked — AC-1
+    assert lease.released is False  # we never held the lease
+
+
+def test_single_flight_runs_and_releases_when_free():
+    from fintin.core.catchup import catch_up_single_flight
+
+    lease = _FakeLease(acquired=True)
+    inner = catch_up(
+        _work(),  # empty → NOTHING_TO_DO, a cheap real report
+        strategy=_FakeStrategy(),
+        insert_rows=_capturing_insert()[0],
+        taxonomy_version="v",
+        version=1,
+    )
+    report = catch_up_single_flight(lease, lambda: inner)
+    assert report is inner  # the run's own report is returned unchanged
+    assert report.status is CatchUpStatus.NOTHING_TO_DO
+    assert lease.released is True  # released after the run
+
+
+def test_already_running_is_a_catchup_status_member():
+    assert CatchUpStatus.ALREADY_RUNNING.value == "ALREADY_RUNNING"
+
+
 # --- purity guard --------------------------------------------------------------
 
 

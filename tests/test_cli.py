@@ -10,6 +10,15 @@ from fintin.cli.app import app
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_cwd(tmp_path, monkeypatch):
+    """Run every CLI test in a throwaway CWD. The ingestion commands create a
+    default `fintin.lease` (single-flight, Story 3.2) in the working directory, so
+    without this a lease file could land in the repo root. Config files use
+    absolute tmp paths, so relocating the CWD is harmless."""
+    monkeypatch.chdir(tmp_path)
+
+
 def test_help_exit_zero_and_lists_command():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -536,6 +545,81 @@ def test_catch_up_completed_renders_summary_and_gaps_exit_0(tmp_path, monkeypatc
     assert "recorded as explained gaps" in result.output
     assert "CIK 1: RuntimeError: boom" in result.output  # --show-gaps enumeration
     assert "Traceback" not in result.output
+
+
+# --- single-flight lease (Story 3.2) -------------------------------------------
+# A second trigger while a run holds the shared lease must return ALREADY_RUNNING
+# (exit-0) and issue NO EDGAR request. We hold a real FileLease on the configured
+# path and monkeypatch discovery/engine to RAISE if reached — proving coalesce
+# never touches EDGAR (AC-1, offline, NFR-7).
+
+
+def _boom_if_called(msg):
+    def _f(*a, **k):
+        raise AssertionError(msg)
+
+    return _f
+
+
+def test_catch_up_already_running_coalesces_exit_0(tmp_path, monkeypatch):
+    import fintin.adapters.edgar.filings_index as fi_mod
+    from fintin.adapters.lease.file_lease import FileLease
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        fi_mod,
+        "fetch_work_candidates",
+        _boom_if_called("EDGAR discovery must not run while coalesced"),
+    )
+    lease_path = str(tmp_path / "test.lease")
+    holder = FileLease(lease_path, ttl_seconds=120, heartbeat_seconds=15)
+    assert holder.acquire() is True
+    try:
+        p = tmp_path / "fintin.toml"
+        p.write_text(
+            _CH_ONLY
+            + "\n[universe]\nciks = [320193]\n"
+            + _EDGAR_VALID
+            + f'\n[lease]\npath = "{lease_path}"\n'
+        )
+        result = runner.invoke(app, ["catch-up", "--config", str(p)])
+        assert result.exit_code == 0
+        assert "ALREADY_RUNNING" in result.output
+        assert "no EDGAR request" in result.output
+        assert "Traceback" not in result.output
+    finally:
+        holder.release()
+
+
+def test_backfill_already_running_coalesces_exit_0(tmp_path, monkeypatch):
+    # AC-6: backfill shares the SAME lease, so it coalesces too (a backfill +
+    # catch-up together would double the EDGAR rate — the ban this prevents).
+    import fintin.core.backfill as bf_mod
+    from fintin.adapters.lease.file_lease import FileLease
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        bf_mod,
+        "backfill_universe",
+        _boom_if_called("backfill_universe must not run while coalesced"),
+    )
+    lease_path = str(tmp_path / "test.lease")
+    holder = FileLease(lease_path, ttl_seconds=120, heartbeat_seconds=15)
+    assert holder.acquire() is True
+    try:
+        p = tmp_path / "fintin.toml"
+        p.write_text(
+            _CH_ONLY
+            + "\n[universe]\nciks = [320193]\n"
+            + _EDGAR_VALID
+            + f'\n[lease]\npath = "{lease_path}"\n'
+        )
+        result = runner.invoke(app, ["backfill", "--config", str(p)])
+        assert result.exit_code == 0
+        assert "ALREADY_RUNNING" in result.output
+        assert "Traceback" not in result.output
+    finally:
+        holder.release()
 
 
 # --- status (Story 2.4) --------------------------------------------------------

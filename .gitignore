@@ -15,6 +15,10 @@ build/
 # Copy fintin.toml.example -> fintin.toml and edit locally.
 fintin.toml
 
+# Single-flight lease file (runtime state; the default [lease].path). If you set a
+# custom lease path in fintin.toml, that file is runtime state too — ignore it.
+fintin.lease
+
 # macOS
 .DS_Store
 

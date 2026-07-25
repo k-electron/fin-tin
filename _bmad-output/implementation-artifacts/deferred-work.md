@@ -1,5 +1,17 @@
 # Deferred Work
 
+## Resolved by / Deferred from: story-3.2 (2026-07-24, single-flight lease)
+
+**Resolved by Story 3.2** (the AD-12 filesystem lease with a background heartbeat thread wired into both `catch-up` and `backfill`):
+- story-1.3 "Cool-down is an uninterruptible blocking sleep" (no heartbeat during the ≥10-min cool-down) — the lease's **background** heartbeat thread beats *through* the main-thread cool-down sleep, so a run in cool-down is not reclaimed (AC-3), without making the sleep interruptible. The `EdgarClient.run` cool-down policy is unchanged; the AD-12 forward-hook comment is now realized by the thread.
+- story-2.3 "A long backfill inherits the uninterruptible cool-down + no single-flight lease" — `backfill` now acquires the shared lease (same path as `catch-up`), so at most one ingestion run touches EDGAR at a time, and it heartbeats through cool-downs.
+- story-3.1 "No single-flight lease yet (Story 3.2)" — `catch-up` now acquires the lease and returns `ALREADY_RUNNING` (exit-0, no EDGAR request) when a run is already active.
+
+**Still deferred (new):**
+- **Concurrent-reclaim micro-race on a stale lease** (low, single-machine) — `FileLease.acquire` reclaims an expired lease by `os.unlink` + atomic `os.link`; two triggers that both observe the *same* stale lease at the same instant could both unlink+relink and both believe they acquired (the classic filesystem-lease reclaim race). Negligible on a single-user laptop (v1's target): it requires two triggers firing within microseconds of each other exactly as a lease crosses its TTL. The common paths are race-free — a free acquire and a live-lease coalesce are guarded by `os.link`'s atomic exclusivity, and a per-acquire `token` stops heartbeat/release from touching a lease we no longer own. A fully-robust reclaim would need `fcntl`/`flock` (POSIX advisory locks). Revisit if fin-tin ever runs multi-process on a shared filesystem.
+- **Lease is not held across the offline pre-flight** (low, by design) — `check_connection` (a ClickHouse ping) runs before the lease is acquired, so a coalesced trigger does one local ClickHouse round-trip before returning `ALREADY_RUNNING`. AC-1 forbids only **EDGAR** requests on coalesce (satisfied — discovery is inside the guarded `_run`); the ClickHouse ping is local and cheap. Moving it inside the guard would slightly reduce coalesced-trigger work; not worth the restructure.
+
+
 ## Deferred from: code review of story-1.2 (2026-07-23)
 
 - **Schema migrations** (medium) — `fintin/adapters/store/schema.py` uses `CREATE … IF NOT EXISTS`, which silently keeps a stale table/MV definition if its DDL later changes; only the `screening_mart` view (`CREATE OR REPLACE`) is refreshed. There is no migration/versioning story, so a DDL change (e.g. the F1 resolution-rank fix) won't apply to an already-created deployment without a manual drop/recreate. Deferred because the v1 schema is still stabilizing and this is a solo local tool; a create-only limitation note is documented in `schema.py` now. Revisit with a proper migration mechanism when the schema settles or a second environment appears.

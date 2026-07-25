@@ -292,3 +292,44 @@ def test_reconcile_validation_rejects(tmp_path, block):
     p.write_text(_VALID + "\n" + textwrap.dedent(block))
     with pytest.raises(ConfigError):
         load_config(p)
+
+
+def test_lease_absent_uses_default(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID)
+    cfg = load_config(p)
+    assert cfg.lease.path == "fintin.lease"
+    assert cfg.lease.ttl_seconds == 120
+    assert cfg.lease.heartbeat_seconds == 15
+
+
+def test_lease_parses(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(
+        _VALID
+        + '\n[lease]\npath = "/tmp/my.lease"\nttl_seconds = 60\nheartbeat_seconds = 10\n'
+    )
+    cfg = load_config(p)
+    assert cfg.lease.path == "/tmp/my.lease"
+    assert cfg.lease.ttl_seconds == 60
+    assert cfg.lease.heartbeat_seconds == 10
+
+
+@pytest.mark.parametrize(
+    "block",
+    [
+        "[lease]\nttl_seconds = 20\nheartbeat_seconds = 15\n",  # 2*hb > ttl (not << TTL)
+        "[lease]\nttl_seconds = 1\n",  # below the >=2 floor
+        "[lease]\nheartbeat_seconds = 0\n",  # below the >=1 floor
+        "[lease]\nttl_seconds = true\n",  # bool masquerading as int
+        '[lease]\nttl_seconds = "60"\n',  # not an int
+        "[lease]\nheartbeat_seconds = 1.5\n",  # float
+        '[lease]\npath = ""\n',  # blank path
+        "[lease]\npath = 5\n",  # non-string path
+    ],
+)
+def test_lease_validation_rejects(tmp_path, block):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_VALID + "\n" + textwrap.dedent(block))
+    with pytest.raises(ConfigError):
+        load_config(p)

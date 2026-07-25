@@ -51,3 +51,15 @@ ciks = [
 # `fintin work-list` (and, later, catch-up) re-scans EDGAR's index over — wide
 # enough to catch stragglers/restatements filed just before the high-water mark.
 lookback_days = 7
+
+[lease]
+# Single-flight self-expiring lease (optional; omit to use the defaults below).
+# At most one ingestion run (backfill / catch-up) touches EDGAR at a time — a
+# concurrent second trigger returns ALREADY_RUNNING (exit-0) and issues NO EDGAR
+# request, so overlapping runs can't double the request rate (a ban). This is a
+# local lock FILE (below), not ClickHouse; it self-expires so a crashed run never
+# permanently deadlocks the tool. The lease file holds only {pid, host, timestamps}
+# (no secrets) and is runtime state — gitignored.
+path = "fintin.lease"      # lock-file path (relative to the working directory)
+ttl_seconds = 120          # a lease is expired this long after its last heartbeat
+heartbeat_seconds = 15     # a live run refreshes the lease this often (must be <= ttl/2)
