@@ -1,6 +1,10 @@
+---
+baseline_commit: 5453e481280c6f73359458507e8a924fea492340
+---
+
 # Story 2.4: Coverage & status report
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -30,29 +34,29 @@ so that I know what's ingested and what's an explained gap — with no silent om
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Pure coverage engine** (AC: 1, 2, 4) — `fintin/core/coverage.py` (NEW, pure)
-  - [ ] Define `CoverageReport(NamedTuple)`: `in_scope: int`, `present: int`, `zero_fact_ciks: tuple[int, ...]` (sorted), `resolution_gaps: tuple[UniverseGap, ...]`, `hwm: date | None`. Convenience `@property`: `missing` (= `len(zero_fact_ciks)`), `total_gaps` (= `missing + len(resolution_gaps)`), `is_complete` (= `missing == 0 and not resolution_gaps`).
-  - [ ] Implement `compute_coverage(resolved: ResolvedUniverse, present: Collection[int], hwm: date | None) -> CoverageReport`. Pure: `in_scope_set = set(resolved.ciks)`; `present_in_scope = in_scope_set & {int(c) for c in present}` (intersect defensively); `zero_fact = tuple(sorted(in_scope_set - present_in_scope))`; carry `resolved.gaps` and `hwm` through. Deterministic (sorted).
-  - [ ] Import only `from fintin.core.universe import ResolvedUniverse, UniverseGap` + stdlib (`date`, `NamedTuple`, `Collection`). No `edgar`/ClickHouse/`pyarrow`.
-- [ ] **Task 2 — `status` CLI trigger** (AC: 1, 2, 3, 6) — `fintin/cli/app.py` (MOD)
-  - [ ] Add `@app.command("status")` with `--config/-c` and `--show-gaps` (enumerate every explained gap; default shows counts).
-  - [ ] `_configure_logging()`; **deferred imports** (all pure `fintin.*` + the offline `resolve_tickers` — **no `edgar` client import**): `resolve_tickers`, `resolve_universe`, `present_ciks`, `high_water_mark`, `compute_coverage`.
-  - [ ] `load_config` → `ConfigError` **exit 2**. `cfg.universe is None` → **exit 2** (clean "no [universe]" message).
-  - [ ] Wrap `resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)` in `try/except Exception` → "Universe resolution failed" **exit 1** (a degraded edgartools install must not print a traceback — the Story 2.3 P1 lesson). Empty `resolved.ciks` → **exit 1**.
-  - [ ] `check_connection(cfg.clickhouse)` → `StoreConnectionError` **exit 1**.
-  - [ ] `client = get_client(...)` in `try/finally` (close via `contextlib.suppress`); `present = present_ciks(client, ciks=resolved.ciks)`; `hwm = high_water_mark(client)`; `report = compute_coverage(resolved, present, hwm)`. Generic `Exception` → "Status failed" **exit 1**.
-  - [ ] Render (GREEN summary): `Coverage: {present} of {in_scope} in-scope company(ies) present. High-water mark: {hwm.isoformat() or 'none (store empty)'}.` Then if `report.total_gaps`: YELLOW `"{total_gaps} explained gap(s): {G} unresolvable ticker(s), {H} zero-fact company(ies)."` If `--show-gaps`: list resolution gaps (`  - {gap.identifier}: {gap.reason}`) then zero-fact CIKs (`  - CIK {cik}: no facts in store`). **exit 0** on a successful report (gaps included).
-  - [ ] **No `EdgarClient` constructed anywhere** in this command (AC-3). Pluralization helper consistent with `universe`/`backfill`.
-- [ ] **Task 3 — Tests (offline; NFR-7)** (AC: 5)
-  - [ ] `tests/test_coverage.py` (NEW, pure): `compute_coverage` with plain sets/dates — present count; zero-fact = sorted set difference; resolution-gap passthrough; `hwm` passthrough; empty store (0 present, all in-scope as zero-fact); fully-covered (`is_complete`); partial; `total_gaps`/`missing` properties; determinism (unsorted input → sorted output). **AST purity guard**: `core/coverage.py` imports no `edgar`/`clickhouse`/`pyarrow` (reuse the `test_universe.py`/`test_reconcile.py` helper).
-  - [ ] `tests/test_cli.py` (MOD): `status` error paths — help lists `status`; missing config → 2; missing `[universe]` → 2; empty-universe (unresolvable-only tickers, offline) → 1; each asserts no `Traceback`.
-  - [ ] `tests/test_cli.py` (MOD, `@pytest.mark.integration`): **end-to-end happy path** — create a throwaway DB (reuse the `schema_client`/`local_clickhouse_config` pattern), seed `raw_fact` rows for one in-scope CIK, write a config toml naming that DB + a `[universe]` with two CIKs (one seeded, one absent), invoke `fintin status --config <toml> --show-gaps`, assert: present count = 1 of 2, the HWM date shows, the absent CIK is listed as `no facts in store`, exit 0, no `Traceback`. (This is offline — ClickHouse only, no EDGAR — so NFR-7 holds trivially.)
-- [ ] **Task 4 — Validate & document** (AC: all)
-  - [ ] `uv run pytest` — full suite green; record count + delta.
-  - [ ] Update `README.md`: a "Check coverage & status" section (`fintin status`, `--show-gaps`; offline; explained gaps = unresolvable tickers + zero-fact companies; a failed-backfill company shows as `no facts in store`).
-  - [ ] `fintin.toml.example` needs **no** change.
-  - [ ] Append any 2.4 deferred item to `deferred-work.md` (e.g. `status` shows DB-derived absence, not the ephemeral per-run failure reason — the AD-1 trade).
-  - [ ] (Optional) Live smoke: `fintin status` against the local `default` DB (offline — needs no email) on the existing Apple data + a deliberately-absent CIK.
+- [x] **Task 1 — Pure coverage engine** (AC: 1, 2, 4) — `fintin/core/coverage.py` (NEW, pure)
+  - [x] Define `CoverageReport(NamedTuple)`: `in_scope: int`, `present: int`, `zero_fact_ciks: tuple[int, ...]` (sorted), `resolution_gaps: tuple[UniverseGap, ...]`, `hwm: date | None`. Convenience `@property`: `missing` (= `len(zero_fact_ciks)`), `total_gaps` (= `missing + len(resolution_gaps)`), `is_complete` (= `missing == 0 and not resolution_gaps`).
+  - [x] Implement `compute_coverage(resolved: ResolvedUniverse, present: Collection[int], hwm: date | None) -> CoverageReport`. Pure: `in_scope_set = set(resolved.ciks)`; `present_in_scope = in_scope_set & {int(c) for c in present}` (intersect defensively); `zero_fact = tuple(sorted(in_scope_set - present_in_scope))`; carry `resolved.gaps` and `hwm` through. Deterministic (sorted).
+  - [x] Import only `from fintin.core.universe import ResolvedUniverse, UniverseGap` + stdlib (`date`, `NamedTuple`, `Collection`). No `edgar`/ClickHouse/`pyarrow`.
+- [x] **Task 2 — `status` CLI trigger** (AC: 1, 2, 3, 6) — `fintin/cli/app.py` (MOD)
+  - [x] Add `@app.command("status")` with `--config/-c` and `--show-gaps` (enumerate every explained gap; default shows counts).
+  - [x] `_configure_logging()`; **deferred imports** (all pure `fintin.*` + the offline `resolve_tickers` — **no `edgar` client import**): `resolve_tickers`, `resolve_universe`, `present_ciks`, `high_water_mark`, `compute_coverage`.
+  - [x] `load_config` → `ConfigError` **exit 2**. `cfg.universe is None` → **exit 2** (clean "no [universe]" message).
+  - [x] Wrap `resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)` in `try/except Exception` → "Universe resolution failed" **exit 1** (a degraded edgartools install must not print a traceback — the Story 2.3 P1 lesson). Empty `resolved.ciks` → **exit 1**.
+  - [x] `check_connection(cfg.clickhouse)` → `StoreConnectionError` **exit 1**.
+  - [x] `client = get_client(...)` in `try/finally` (close via `contextlib.suppress`); `present = present_ciks(client, ciks=resolved.ciks)`; `hwm = high_water_mark(client)`; `report = compute_coverage(resolved, present, hwm)`. Generic `Exception` → "Status failed" **exit 1**.
+  - [x] Render (GREEN summary): `Coverage: {present} of {in_scope} in-scope company(ies) present. High-water mark: {hwm.isoformat() or 'none (store empty)'}.` Then if `report.total_gaps`: YELLOW `"{total_gaps} explained gap(s): {G} unresolvable ticker(s), {H} zero-fact company(ies)."` If `--show-gaps`: list resolution gaps (`  - {gap.identifier}: {gap.reason}`) then zero-fact CIKs (`  - CIK {cik}: no facts in store`). **exit 0** on a successful report (gaps included).
+  - [x] **No `EdgarClient` constructed anywhere** in this command (AC-3). Pluralization helper consistent with `universe`/`backfill`.
+- [x] **Task 3 — Tests (offline; NFR-7)** (AC: 5)
+  - [x] `tests/test_coverage.py` (NEW, pure): `compute_coverage` with plain sets/dates — present count; zero-fact = sorted set difference; resolution-gap passthrough; `hwm` passthrough; empty store (0 present, all in-scope as zero-fact); fully-covered (`is_complete`); partial; `total_gaps`/`missing` properties; determinism (unsorted input → sorted output). **AST purity guard**: `core/coverage.py` imports no `edgar`/`clickhouse`/`pyarrow` (reuse the `test_universe.py`/`test_reconcile.py` helper).
+  - [x] `tests/test_cli.py` (MOD): `status` error paths — help lists `status`; missing config → 2; missing `[universe]` → 2; empty-universe (unresolvable-only tickers, offline) → 1; each asserts no `Traceback`.
+  - [x] `tests/test_cli.py` (MOD, `@pytest.mark.integration`): **end-to-end happy path** — create a throwaway DB (reuse the `schema_client`/`local_clickhouse_config` pattern), seed `raw_fact` rows for one in-scope CIK, write a config toml naming that DB + a `[universe]` with two CIKs (one seeded, one absent), invoke `fintin status --config <toml> --show-gaps`, assert: present count = 1 of 2, the HWM date shows, the absent CIK is listed as `no facts in store`, exit 0, no `Traceback`. (This is offline — ClickHouse only, no EDGAR — so NFR-7 holds trivially.)
+- [x] **Task 4 — Validate & document** (AC: all)
+  - [x] `uv run pytest` — full suite green; record count + delta.
+  - [x] Update `README.md`: a "Check coverage & status" section (`fintin status`, `--show-gaps`; offline; explained gaps = unresolvable tickers + zero-fact companies; a failed-backfill company shows as `no facts in store`).
+  - [x] `fintin.toml.example` needs **no** change.
+  - [x] Append any 2.4 deferred item to `deferred-work.md` (e.g. `status` shows DB-derived absence, not the ephemeral per-run failure reason — the AD-1 trade).
+  - [x] (Optional) Live smoke: `fintin status` against the local `default` DB (offline — needs no email) on the existing Apple data + a deliberately-absent CIK.
 
 ## Dev Notes
 
@@ -125,12 +129,33 @@ report   = compute_coverage(resolved, present, hwm)            # pure: in-scope 
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Opus 4.8, 1M context)
+
 ### Debug Log References
+
+- `uv run pytest -q` → 258 passed (+13 over the 245 baseline). New `test_coverage.py` (8, pure incl. AST guard); `test_cli.py` +5 (`status` help + 3 error paths + 1 offline end-to-end integration happy-path). Python 3.14 in `.venv` (≥ 3.12 floor).
+- Live smoke (offline — no email; scratchpad config with only `[clickhouse]` + `[universe]`, removed after): `fintin status --show-gaps` over `ciks = [320193, 1652044]` against the local `default` DB → `Coverage: 1 of 2 in-scope companies present. High-water mark: 2026-05-01. 1 explained gap(s): 0 unresolvable ticker(s), 1 zero-fact company(ies). — CIK 1652044: no facts in store`. Exit 0. Confirms the derived zero-fact gap + currency, with no EDGAR request and no PII in the config.
 
 ### Completion Notes List
 
+- **Composition/read-only story, as designed.** Pure `compute_coverage` (`core/coverage.py`) does the set math (in-scope − present); the `status` CLI does two store reads (`present_ciks`, `high_water_mark`) + offline `resolve_universe`, then renders. No new repo query, no DDL, no config change (AD-1/AD-18).
+- **Offline (AC-3).** `status` constructs **no `EdgarClient`** and needs no contact email — verified structurally (deferred imports are pure `fintin.*` + the offline bundled-parquet `resolve_tickers`) and by the no-email live smoke.
+- **Two gap classes, no silent omissions (SM-2).** Unresolvable-ticker gaps (`resolved.gaps`, rendered like `universe`) and zero-fact companies (in-scope CIKs absent from `raw_fact`, rendered `CIK <n>: no facts in store`). Counts always; `--show-gaps` enumerates. A failed-backfill company = DB absence → derived reason (AC-2, AD-1).
+- **Determinism (kboss):** `zero_fact_ciks` sorted; gaps in config order.
+- **Carried the 2.3 review lessons forward:** wrapped `resolve_universe` (P1 traceback guard) and surfaced `resolved.gaps` (P5) from the start.
+- **Capstone offline test:** because `status` is offline, added the end-to-end CLI integration happy-path (throwaway DB, seed one CIK, assert coverage + the absent CIK as a zero-fact gap) — the EDGAR-touching commands couldn't have this.
+- Exit codes: `ConfigError`→2, missing `[universe]`→2, resolution-fail/empty-universe→1, `StoreConnectionError`→1, generic→1; a successful report (gaps included) → 0. Never a traceback.
+
 ### File List
+
+- `fintin/core/coverage.py` (NEW) — pure `CoverageReport` + `compute_coverage`.
+- `fintin/cli/app.py` (MOD) — `status` command (offline; `--show-gaps`).
+- `tests/test_coverage.py` (NEW) — pure coverage tests + AST purity guard.
+- `tests/test_cli.py` (MOD) — `status` error paths + offline end-to-end integration happy-path (`import pytest` added).
+- `README.md` (MOD) — "Check coverage & status" section.
+- `_bmad-output/implementation-artifacts/deferred-work.md` (MOD) — Story 2.4 AD-1 derived-reason note.
 
 ## Change Log
 
 - 2026-07-24 — Story 2.4 drafted via create-story (2 parallel research agents: architecture/AC crux + code inventory). Design settled: offline read-only `fintin status`; pure `compute_coverage` in `core/coverage.py`; composes `resolve_universe` + `present_ciks` + `high_water_mark`; explained gaps = unresolvable tickers + zero-fact companies (derived, AD-1 — a failed-backfill company = DB absence, reason "no facts in store"); no EdgarClient/email (AC-3); no DDL/config. Status → ready-for-dev.
+- 2026-07-24 — Story 2.4 implemented (red-green-refactor through all 4 tasks). Pure `compute_coverage` engine + `CoverageReport` (`core/coverage.py`); offline `fintin status` dumb trigger (`--show-gaps`). Composes `resolve_universe` (offline) + `present_ciks` + `high_water_mark`; derives coverage by set difference (AD-1 — no failures table). Two gap classes surfaced (SM-2). No `EdgarClient`/email (AC-3), no DDL/config change (AD-18). **258 tests pass (+13)**; AST guard confirms `core/coverage.py` is `edgar`/ClickHouse/`pyarrow`-free; the offline happy path is end-to-end integration-tested (NFR-7: zero live-EDGAR). Live smoke confirmed the derived zero-fact gap + HWM with no email. Status → review.

@@ -675,6 +675,104 @@ def backfill_command(
                 typer.secho(f"  - CIK {gap.cik}: {gap.reason}", fg=typer.colors.YELLOW)
 
 
+@app.command("status")
+def status_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    show_gaps: bool = typer.Option(
+        False,
+        "--show-gaps",
+        help="Enumerate every explained gap (unresolvable tickers + zero-fact companies).",
+    ),
+) -> None:
+    """Report Universe coverage & currency: how many in-scope companies are present,
+    the high-water mark, and every explained gap. Offline — reads ClickHouse and the
+    bundled reference table only; no EDGAR request, no contact email."""
+    _configure_logging()
+    # Offline command (AC-3): the deferred imports are all pure fintin.* + the
+    # offline bundled-parquet resolver — NO EdgarClient, NO edgar network at all.
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.adapters.store.raw_fact_repo import high_water_mark, present_ciks
+    from fintin.core.coverage import compute_coverage
+    from fintin.core.universe import resolve_universe
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    if cfg.universe is None:
+        typer.secho(
+            f"Config error: no [universe] section in {config} — define the Universe first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Resolution is offline (bundled table). It can still fail on a degraded
+    # edgartools install — render it cleanly, never as a traceback (Story 2.3 P1).
+    try:
+        resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    except Exception as exc:
+        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    if not resolved.ciks:
+        typer.secho(
+            "Resolved Universe is empty — check the [universe] tickers/ciks.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # Membership (AD-16) decides presence; the HWM is a currency hint only.
+        present = present_ciks(client, ciks=resolved.ciks)
+        hwm = high_water_mark(client)
+        report = compute_coverage(resolved, present, hwm)
+    except Exception as exc:  # query error (connection already verified)
+        typer.secho(f"Status failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    noun = "company" if report.in_scope == 1 else "companies"
+    hwm_str = report.hwm.isoformat() if report.hwm is not None else "none (store empty)"
+    typer.secho(
+        f"Coverage: {report.present} of {report.in_scope} in-scope {noun} present. "
+        f"High-water mark: {hwm_str}.",
+        fg=typer.colors.GREEN,
+    )
+    # Explained gaps are a known state, not an error — the report still exits 0
+    # (gaps are surfaced, never silently omitted; SM-2).
+    if report.total_gaps:
+        typer.secho(
+            f"{report.total_gaps} explained gap(s): "
+            f"{len(report.resolution_gaps)} unresolvable ticker(s), "
+            f"{report.missing} zero-fact company(ies).",
+            fg=typer.colors.YELLOW,
+        )
+        if show_gaps:
+            for gap in report.resolution_gaps:
+                typer.secho(f"  - {gap.identifier}: {gap.reason}", fg=typer.colors.YELLOW)
+            for cik in report.zero_fact_ciks:
+                typer.secho(f"  - CIK {cik}: no facts in store", fg=typer.colors.YELLOW)
+
+
 def main() -> None:
     app()
 

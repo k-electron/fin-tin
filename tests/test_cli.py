@@ -1,7 +1,8 @@
-"""CLI skeleton tests (no container required)."""
+"""CLI skeleton tests (no container required unless marked integration)."""
 
 from __future__ import annotations
 
+import pytest
 from typer.testing import CliRunner
 
 from fintin.cli.app import app
@@ -354,3 +355,111 @@ def test_backfill_systemic_abort_exits_1(tmp_path, monkeypatch):
     assert result.exit_code == 1
     assert "consecutive failures" in result.output
     assert "Traceback" not in result.output
+
+
+# --- status (Story 2.4) --------------------------------------------------------
+# Offline command (ClickHouse + bundled-parquet resolution only, NO EdgarClient).
+# Error paths are pure-offline; the happy path is integration-tested end to end
+# (status is the one command whose happy path needs no live EDGAR).
+
+
+def test_help_lists_status():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "status" in result.output
+
+
+def test_status_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["status", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_status_missing_universe_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)  # no [universe]
+    result = runner.invoke(app, ["status", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "[universe]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_status_empty_universe_exits_1(tmp_path):
+    # Unresolvable-only tickers → empty resolved Universe → exit 1, fully offline
+    # (resolution reads the bundled table; no [edgar] block / EdgarClient needed).
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["ZZZZINVALID"]\n')
+    result = runner.invoke(app, ["status", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "empty" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.integration
+def test_status_happy_path_reports_coverage_and_gaps(tmp_path, local_clickhouse_config):
+    # End-to-end, offline: seed one in-scope company; the other in-scope CIK is
+    # absent → reported as a zero-fact explained gap. No EDGAR involved.
+    import uuid
+    from datetime import date
+
+    from fintin.adapters.store import schema as store_schema
+    from fintin.adapters.store.client import get_client
+    from fintin.adapters.store.raw_fact_repo import insert_raw_facts
+    from fintin.core.ingest import RawFactRow
+
+    db = f"fintin_test_{uuid.uuid4().hex[:12]}"
+    admin = get_client(local_clickhouse_config)
+    try:
+        admin.command(f"CREATE DATABASE {db}")
+    finally:
+        admin.close()
+
+    try:
+        client = get_client(local_clickhouse_config, database=db)
+        try:
+            store_schema.create_schema(client)
+            insert_raw_facts(
+                client,
+                [
+                    RawFactRow(
+                        cik=320193,
+                        accession="0000320193-24-000001",
+                        raw_tag="us-gaap:Revenues",
+                        raw_label="Revenues",
+                        taxonomy="us-gaap",
+                        period_start=date(2023, 1, 1),
+                        period_end=date(2023, 12, 31),
+                        unit="USD",
+                        value=1000.0,
+                        form="10-K",
+                        filed_date=date(2024, 2, 1),
+                        content_hash="h",
+                        taxonomy_version="5.43.0",
+                        version=1,
+                    )
+                ],
+            )
+        finally:
+            client.close()
+
+        ch = local_clickhouse_config
+        p = tmp_path / "fintin.toml"
+        p.write_text(
+            f'[clickhouse]\nhost = "{ch.host}"\nport = {ch.port}\n'
+            f'username = "{ch.username}"\npassword = "{ch.password}"\ndatabase = "{db}"\n'
+            "\n[universe]\nciks = [320193, 1652044]\n"  # one present, one absent
+        )
+        result = runner.invoke(app, ["status", "--config", str(p), "--show-gaps"])
+        assert result.exit_code == 0
+        assert "1 of 2 in-scope companies present" in result.output
+        assert "2024-02-01" in result.output  # the high-water mark
+        assert "1 zero-fact company" in result.output
+        assert "CIK 1652044: no facts in store" in result.output  # the absent CIK
+        assert "Traceback" not in result.output
+    finally:
+        cleanup = get_client(local_clickhouse_config)
+        try:
+            cleanup.command(f"DROP DATABASE IF EXISTS {db}")
+        finally:
+            cleanup.close()
