@@ -73,21 +73,25 @@ def test_tier0_tier1_engines_and_key(schema_client):
 
 
 @pytest.mark.integration
-def test_resolution_and_mart_created(schema_client):
-    """AC-2: resolution MV (AggregatingMergeTree) + wide mart exist."""
+def test_mart_and_wide_view_created(schema_client):
+    """The screening surfaces exist — and the superseded resolution layer does not.
+
+    Story 1.2's AC-2 also required an element-grained resolution MV (resolved_fact
+    + resolved_fact_mv). Story 1.6's Approach B moved concept resolution to a view
+    derived on read over `canonical_fact`, leaving that MV read by nothing while it
+    still fired on every Tier 1 insert, so it was dropped (see the deferred-work
+    ledger). This asserts it is not silently re-created.
+    """
     client, db = schema_client
     store_schema.create_schema(client)
-    engine = client.query(
-        f"SELECT engine FROM system.tables WHERE database = '{db}' AND name = 'resolved_fact'"
-    ).result_rows
-    assert engine and engine[0][0] == "AggregatingMergeTree"
     names = {
         r[0]
         for r in client.query(
             f"SELECT name FROM system.tables WHERE database = '{db}'"
         ).result_rows
     }
-    assert {"resolved_fact_mv", "screening_mart"} <= names
+    assert {"raw_fact", "canonical_fact", "screening_mart", "screening_wide"} <= names
+    assert not ({"resolved_fact", "resolved_fact_mv"} & names)
 
 
 @pytest.mark.integration
@@ -102,7 +106,12 @@ def test_schema_init_is_idempotent(schema_client):
     after = client.query(
         f"SELECT count() FROM system.tables WHERE database = '{db}'"
     ).result_rows[0][0]
-    assert before == after == 6  # 4 tables + 2 views (screening_mart, screening_wide); MV uses TO
+    # Derived from the DDL list rather than hardcoded: each statement creates exactly
+    # one `system.tables` entry, so adding or removing an object can't silently drift
+    # this count out of date (a hardcoded 6 did exactly that when the superseded
+    # resolution MV was dropped).
+    expected = len(store_schema.SCHEMA_STATEMENTS)
+    assert before == after == expected
 
 
 @pytest.mark.integration
