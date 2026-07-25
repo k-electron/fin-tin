@@ -37,6 +37,7 @@ Key invariants:
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from fintin.adapters.store.concept_dictionary import CONCEPT_DICTIONARY, ConceptDef
 
@@ -177,12 +178,22 @@ def _build_screening_wide() -> str:
 
 SCREENING_WIDE = _build_screening_wide()
 
-# Strict creation order — MV + mart created before any insert (AD-18).
-SCHEMA_STATEMENTS: tuple[tuple[str, str], ...] = (
-    ("raw_fact", RAW_FACT),
-    ("canonical_fact", CANONICAL_FACT),
-    ("screening_mart", SCREENING_MART),
-    ("screening_wide", SCREENING_WIDE),
+class SchemaObject(NamedTuple):
+    """One store object: its name, what kind of thing it is (so it can be dropped
+    with the right statement), and the DDL that creates it."""
+
+    name: str
+    kind: str  # "TABLE" | "VIEW"
+    ddl: str
+
+
+# Strict creation order — every derived surface created before any insert (AD-18).
+# `drop_schema` walks this in reverse, so dependents go before their sources.
+SCHEMA_STATEMENTS: tuple[SchemaObject, ...] = (
+    SchemaObject("raw_fact", "TABLE", RAW_FACT),
+    SchemaObject("canonical_fact", "TABLE", CANONICAL_FACT),
+    SchemaObject("screening_mart", "VIEW", SCREENING_MART),
+    SchemaObject("screening_wide", "VIEW", SCREENING_WIDE),
 )
 
 
@@ -192,7 +203,26 @@ def create_schema(client) -> list[str]:
     (from `fintin.adapters.store.client.get_client`); DDL targets the client's
     current database. This is the ONLY place that issues DDL (AD-18)."""
     created: list[str] = []
-    for name, ddl in SCHEMA_STATEMENTS:
-        client.command(ddl)
-        created.append(name)
+    for obj in SCHEMA_STATEMENTS:
+        client.command(obj.ddl)
+        created.append(obj.name)
     return created
+
+
+def drop_schema(client) -> list[str]:
+    """Drop every fin-tin object, in reverse creation order. Returns the names
+    dropped (in drop order). Idempotent (``IF EXISTS``) — dropping an already-empty
+    database is a no-op, not an error.
+
+    **Destroys the whole corpus.** Scoped deliberately: it drops only the objects
+    fin-tin declares above, in the client's current database, so anything else
+    living in that database is untouched (unlike `docker compose down -v`, which
+    discards the entire volume). Re-derivable by definition — every row comes from
+    EDGAR — which is why a wipe-and-repopulate is a supported workflow rather than
+    a data-loss event. Like `create_schema`, this is DDL and therefore lives here
+    (AD-18)."""
+    dropped: list[str] = []
+    for obj in reversed(SCHEMA_STATEMENTS):
+        client.command(f"DROP {obj.kind} IF EXISTS {obj.name}")
+        dropped.append(obj.name)
+    return dropped

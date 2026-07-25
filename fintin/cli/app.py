@@ -176,6 +176,92 @@ def schema_init_command(
     )
 
 
+@app.command("reset")
+def reset_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm the wipe. Without it, reset reports what it WOULD drop and stops.",
+    ),
+    recreate: bool = typer.Option(
+        False,
+        "--recreate",
+        help="Recreate the empty schema after dropping (equivalent to a following schema-init).",
+    ),
+) -> None:
+    """Drop every fin-tin object, wiping the corpus — start over from scratch."""
+    _configure_logging()
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    targets = [obj.name for obj in store_schema.SCHEMA_STATEMENTS]
+    if not yes:
+        # Destructive and irreversible from the tool's side — make the operator
+        # say so explicitly. Naming the database matters: the same command run
+        # against the wrong config would wipe a different store.
+        typer.secho(
+            f"Refusing to drop {len(targets)} object(s) in database "
+            f"'{cfg.clickhouse.database}' without --yes: {', '.join(targets)}.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        typer.secho(
+            "Re-run with --yes to wipe (add --recreate to leave an empty schema "
+            "ready). The corpus is re-derivable from EDGAR with `fintin populate`.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    logger.info(
+        "Dropping fin-tin objects in ClickHouse %s:%s (database=%s)",
+        cfg.clickhouse.host,
+        cfg.clickhouse.port,
+        cfg.clickhouse.database,
+    )
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        dropped = store_schema.drop_schema(client)
+        created = store_schema.create_schema(client) if recreate else []
+    except Exception as exc:  # DDL error (connection already verified above)
+        raise _fail_unexpected("Reset failed", exc)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    typer.secho(
+        f"Dropped {len(dropped)} object(s) from '{cfg.clickhouse.database}': "
+        f"{', '.join(dropped)}.",
+        fg=typer.colors.GREEN,
+    )
+    if recreate:
+        typer.secho(
+            f"Recreated empty schema: {', '.join(created)}.", fg=typer.colors.GREEN
+        )
+    else:
+        typer.secho(
+            "Run `fintin schema-init` (or `fintin populate`) to rebuild.",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @app.command("ingest-company")
 def ingest_company_command(
     cik: int = typer.Argument(..., help="SEC CIK of the company to ingest (e.g. 320193)."),

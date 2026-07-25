@@ -1049,6 +1049,73 @@ def test_status_fully_covered_has_no_gap_line(tmp_path, status_db, local_clickho
     assert "Traceback" not in res.output
 
 
+# --- reset (destructive; the --yes guard is the safety-critical part) -----------
+
+
+def _reset_env(tmp_path, monkeypatch, dropped=("screening_wide", "screening_mart")):
+    """A reset whose store calls are stubbed, so the guard/reporting is testable
+    without a container."""
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)
+    calls: list[str] = []
+    monkeypatch.setattr(app_mod, "check_connection", lambda cfg: "24.1")
+    monkeypatch.setattr(app_mod, "get_client", lambda cfg: None)
+    monkeypatch.setattr(
+        app_mod.store_schema,
+        "drop_schema",
+        lambda client: (calls.append("drop"), list(dropped))[1],
+    )
+    monkeypatch.setattr(
+        app_mod.store_schema,
+        "create_schema",
+        lambda client: (calls.append("create"), ["raw_fact"])[1],
+    )
+    return p, calls
+
+
+def test_reset_without_yes_drops_nothing(tmp_path, monkeypatch):
+    """The guard: no --yes means no DDL is issued at all, and the user is told
+    which database and objects were at stake."""
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p)])
+    assert result.exit_code == 2
+    assert calls == [], "reset issued DDL without --yes"
+    assert "Refusing to drop" in result.output
+    assert "'default'" in result.output  # names the database it would have wiped
+    assert "screening_wide" in result.output  # and the objects
+    assert "Traceback" not in result.output
+
+
+def test_reset_with_yes_drops_and_reports(tmp_path, monkeypatch):
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p), "--yes"])
+    assert result.exit_code == 0
+    assert calls == ["drop"]  # dropped, did NOT recreate
+    assert "Dropped 2 object(s)" in result.output
+    assert "schema-init" in result.output  # tells you how to rebuild
+
+
+def test_reset_recreate_rebuilds_the_empty_schema(tmp_path, monkeypatch):
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p), "--yes", "--recreate"])
+    assert result.exit_code == 0
+    assert calls == ["drop", "create"]  # order matters
+    assert "Recreated empty schema" in result.output
+
+
+def test_reset_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["reset", "--config", "does-not-exist.toml", "--yes"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_help_lists_reset():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "reset" in result.output
+
+
 # --- --debug traceback escape hatch (cross-command) ----------------------------
 # Every command's terminal `except Exception` renders a friendly one-liner and
 # discards the stack. `--debug` recovers it without changing the default UX.
