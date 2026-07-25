@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import ast
 from datetime import date
-from pathlib import Path
 
 from fintin.core.coverage import CoverageReport, compute_coverage
 from fintin.core.universe import ResolvedUniverse, UniverseGap
+from tests.purity import assert_module_is_pure
 
 
 def _resolved(ciks=(), gaps=(), tickers_resolved=0, explicit_ciks=0) -> ResolvedUniverse:
@@ -81,22 +80,7 @@ def test_empty_universe_is_trivially_complete():
 # --- purity guard --------------------------------------------------------------
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 def test_core_coverage_is_pure():
-    """The coverage engine imports no `edgar`, ClickHouse, or `pyarrow` — the CLI
-    fetches present-CIKs + high-water mark and passes plain values in."""
-    imports = _module_imports("fintin/core/coverage.py")
-    assert "edgar" not in imports
-    assert "clickhouse_connect" not in imports
-    assert "pyarrow" not in imports
+    """The coverage engine imports nothing impure — the CLI fetches present-CIKs +
+    high-water mark and passes plain values in."""
+    assert_module_is_pure("fintin/core/coverage.py")

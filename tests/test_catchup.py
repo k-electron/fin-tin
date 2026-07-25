@@ -10,16 +10,15 @@ vocabulary.
 
 from __future__ import annotations
 
-import ast
 from dataclasses import dataclass
 from datetime import date
-from pathlib import Path
 
 import pytest
 
 from fintin.core.backfill import BackfillAborted
 from fintin.core.catchup import CatchUpReport, CatchUpStatus, catch_up
 from fintin.core.reconcile import WorkItem, WorkList
+from tests.purity import assert_module_is_pure
 
 
 @dataclass
@@ -375,23 +374,8 @@ def test_already_running_is_a_catchup_status_member():
 # --- purity guard --------------------------------------------------------------
 
 
-def _module_imports(path: str) -> set[str]:
-    tree = ast.parse(Path(path).read_text())
-    imported: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for n in node.names:
-                imported.add(n.name.split(".")[0])
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            imported.add(node.module.split(".")[0])
-    return imported
-
-
 def test_core_catchup_is_pure():
-    """The catch-up engine imports no `edgar`, ClickHouse, or `pyarrow` — the CLI
-    runs discovery + builds the strategy; core only composes the reconciler's
-    WorkList with the backfill engine."""
-    imports = _module_imports("fintin/core/catchup.py")
-    assert "edgar" not in imports
-    assert "clickhouse_connect" not in imports
-    assert "pyarrow" not in imports
+    """The catch-up engine imports nothing impure — the CLI runs discovery + builds
+    the strategy; core only composes the reconciler's WorkList with the backfill
+    engine."""
+    assert_module_is_pure("fintin/core/catchup.py")

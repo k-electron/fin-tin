@@ -4,7 +4,7 @@
 insert (ClickHouse materialized views do not backfill pre-existing rows):
 
     raw_fact (Tier 0)  ->  canonical_fact (Tier 1)  ->  screening_mart (wide view)
-                       ->  resolved_fact (+ resolved_fact_mv)   [element-grained, ad-hoc]
+                                                    ->  screening_wide (companion view)
 
 All DDL is idempotent (`IF NOT EXISTS` / `CREATE OR REPLACE VIEW`), so a second
 run is a no-op. No other module may issue DDL.
@@ -27,9 +27,10 @@ Key invariants:
 - AD-8 (Approach B): the wide screening mart resolves the concept dictionary
   (concept_dictionary.py) — latest-filed across a concept's element union, element
   position as the tiebreak — as a VIEW derived on read over `canonical_fact FINAL`
-  (no materialized concept copy, so it can't drift; AD-1). The element-grained
-  resolution MV (resolved_fact, AggregatingMergeTree/argMaxState, auto-populated on
-  Tier 1 insert) is retained for ad-hoc element-level queries, NOT the mart's source.
+  (no materialized concept copy, so it can't drift; AD-1). Story 1.2's
+  element-grained resolution MV (resolved_fact + resolved_fact_mv) was superseded
+  by this and has been DROPPED: nothing read it, yet it fired on every Tier 1
+  insert and stood as a second materialized copy to keep consistent (AD-1).
 - AD-17: instant facts period_start = period_end; duration period_start < period_end.
 """
 
@@ -79,35 +80,6 @@ CREATE TABLE IF NOT EXISTS canonical_fact (
     version           UInt64
 ) ENGINE = ReplacingMergeTree(version)
 ORDER BY (accession, raw_tag, period_start, period_end, unit)
-"""
-
-# Element-grained resolution target (AD-7, AD-8) — argMax over (filed_date, is_amendment,
-# accession, version). Auto-populated by the MV; retained for ad-hoc element-level queries.
-# The wide mart does NOT read this — it resolves concepts on read over canonical_fact (Approach B).
-RESOLVED_FACT = """
-CREATE TABLE IF NOT EXISTS resolved_fact (
-    cik               UInt32,
-    canonical_concept String,
-    unit              String,
-    period_start      Date,
-    period_end        Date,
-    value_state       AggregateFunction(argMax, Float64, Tuple(Date, UInt8, String, UInt64))
-) ENGINE = AggregatingMergeTree
-ORDER BY (cik, canonical_concept, unit, period_start, period_end)
-"""
-
-# Resolution MV — populated on canonical_fact insert (AD-8)
-RESOLVED_FACT_MV = """
-CREATE MATERIALIZED VIEW IF NOT EXISTS resolved_fact_mv TO resolved_fact AS
-SELECT
-    cik,
-    canonical_concept,
-    unit,
-    period_start,
-    period_end,
-    argMaxState(value, (filed_date, toUInt8(endsWith(form, '/A')), accession, version)) AS value_state
-FROM canonical_fact
-GROUP BY cik, canonical_concept, unit, period_start, period_end
 """
 
 # Wide screening mart (AD-8, Approach B) — one row per (cik, period_start, period_end).
@@ -209,8 +181,6 @@ SCREENING_WIDE = _build_screening_wide()
 SCHEMA_STATEMENTS: tuple[tuple[str, str], ...] = (
     ("raw_fact", RAW_FACT),
     ("canonical_fact", CANONICAL_FACT),
-    ("resolved_fact", RESOLVED_FACT),
-    ("resolved_fact_mv", RESOLVED_FACT_MV),
     ("screening_mart", SCREENING_MART),
     ("screening_wide", SCREENING_WIDE),
 )
