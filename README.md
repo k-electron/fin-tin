@@ -163,7 +163,7 @@ each company's full available history:
 uv run fintin schema-init            # once — creates Tier 0/1, the MV, and the mart
 uv run fintin backfill               # ingest every in-scope company's full history
 uv run fintin backfill --show-gaps   # also list any companies recorded as explained gaps
-uv run fintin backfill --refresh     # re-ingest even companies already present (idempotent)
+uv run fintin backfill --refresh     # re-ingest even companies already present (supersedes on read)
 ```
 
 Backfill fetches each company's entire history in **one `companyfacts` request**
@@ -171,16 +171,22 @@ Backfill fetches each company's entire history in **one `companyfacts` request**
 client, and **commits per company**. It **hits EDGAR and needs a real contact
 email**.
 
-- **Resumable, no checkpoint file.** Companies already in the store are skipped
-  (without even re-fetching), so an interrupted backfill just re-run resumes where
-  it left off — resumption is re-derived from the store each run, never from a
-  saved cursor. Re-running a finished backfill is a no-op.
+- **Resumable, no checkpoint file.** Companies that already hold facts in the
+  store are skipped (without even re-fetching), so an interrupted backfill just
+  re-run resumes where it left off — resumption is re-derived from the store each
+  run, never from a saved cursor. Re-running is therefore a no-op for companies
+  that landed facts; a company that returned *no* facts is re-checked each run (a
+  bounded cost that also lets a newly-filing company get picked up). `--refresh`
+  re-ingests everything, superseding prior values on read — note the insert-only
+  model supersedes still-present facts but cannot retract one removed since.
 - **Failures are explained gaps, not crashes.** A company with no facts or a fetch
   error is recorded `(cik, reason)` and the run continues to the next company — no
   silent omissions (`--show-gaps` lists them; the coverage report surfaces them).
 - **Throttle aborts, by design.** If EDGAR throttles and the client exhausts its
   cool-down retries, the run stops rather than continuing to hammer EDGAR —
-  ban-safety always outranks finishing faster.
+  ban-safety always outranks finishing faster. The run likewise aborts if many
+  companies fail in a row (a systemic problem, e.g. the store dropped mid-run),
+  rather than spending EDGAR requests it can't persist.
 
 The backfill strategy is pluggable: the per-company `companyfacts` API is the v1
 strategy; a bulk-download strategy for a much larger Universe can drop in behind

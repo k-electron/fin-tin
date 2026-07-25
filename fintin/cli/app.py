@@ -530,7 +530,8 @@ def backfill_command(
     refresh: bool = typer.Option(
         False,
         "--refresh",
-        help="Re-ingest companies already present (bypass the resume-skip). Idempotent.",
+        help="Re-ingest companies already present (bypass the resume-skip); "
+        "supersedes prior values on read (cannot retract facts removed since).",
     ),
     show_gaps: bool = typer.Option(
         False,
@@ -560,8 +561,13 @@ def backfill_command(
         next_ingest_version,
         present_ciks,
     )
-    from fintin.core.backfill import backfill_universe
+    from fintin.core.backfill import BackfillAborted, backfill_universe
     from fintin.core.universe import resolve_universe
+
+    # Abort the run if this many companies fail in an unbroken row — a systemic
+    # failure (e.g. the store dropped mid-run) must not be laundered into per-
+    # company gaps while still spending EDGAR requests (SM-C1).
+    max_consecutive_failures = 10
 
     try:
         cfg = load_config(config)
@@ -586,9 +592,15 @@ def backfill_command(
         typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
 
-    # Universe resolution is offline (Story 2.1) — an empty resolved Universe is a
-    # hard misconfiguration for a backfill scope.
-    resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    # Universe resolution is offline (Story 2.1). It can still fail on a degraded
+    # edgartools install (unreadable bundled reference table) — render it cleanly,
+    # never as a traceback.
+    try:
+        resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    except Exception as exc:
+        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    # An empty resolved Universe is a hard misconfiguration for a backfill scope.
     if not resolved.ciks:
         typer.secho(
             "Resolved Universe is empty — check the [universe] tickers/ciks.",
@@ -611,11 +623,11 @@ def backfill_command(
     client = None
     try:
         client = get_client(cfg.clickhouse)
-        # One ingest-monotonic version for the whole run (AD-6); company identity
-        # keys are disjoint, so a shared version cannot collide across companies.
+        # One ingest-monotonic version base per run (AD-6); the engine offsets it
+        # per company so a shared cross-company accession resolves deterministically.
         version = next_ingest_version(client)
         # Resume: skip companies already present (derived from the store, not a
-        # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (idempotent).
+        # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
         present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
         report = backfill_universe(
             resolved.ciks,
@@ -625,12 +637,16 @@ def backfill_command(
             version=version,
             already_present=present,
             fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
+            max_consecutive_failures=max_consecutive_failures,
             on_company=_log_company,
         )
     except EdgarThrottleError as exc:
         typer.secho(
             f"EDGAR throttled, backfill aborted: {exc}", fg=typer.colors.RED, err=True
         )
+        raise typer.Exit(code=1)
+    except BackfillAborted as exc:  # systemic failure (e.g. store down) — stop
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     except Exception as exc:  # setup/query error (connection already verified)
         typer.secho(f"Backfill failed: {exc}", fg=typer.colors.RED, err=True)

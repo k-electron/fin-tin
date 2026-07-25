@@ -271,3 +271,86 @@ def test_backfill_placeholder_email_reports_clean_error(tmp_path):
     assert result.exit_code == 2
     assert "EDGAR config error" in result.output
     assert "Traceback" not in result.output
+
+
+# A syntactically valid, non-placeholder email passes the EdgarClient ban-safety
+# gate (so we can reach the post-construction exit-1 paths) without being anyone's
+# real address — safe for a public repo. Mirrors test_config.py's a@b.co.
+_EDGAR_VALID = '\n[edgar]\nuser_agent_name = "fin-tin"\ncontact_email = "a@b.co"\n'
+
+
+def test_backfill_empty_universe_exits_1(tmp_path):
+    # A Universe that resolves to zero companies is a hard misconfiguration →
+    # exit 1, offline: resolution reads the bundled table (no network) and the
+    # empty check precedes any ClickHouse access.
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["ZZZZINVALID"]\n' + _EDGAR_VALID)
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "empty" in result.output
+    assert "Traceback" not in result.output
+
+
+def _stub_store(monkeypatch):
+    """Stub the store client so a backfill CLI test can reach backfill_universe
+    without a live ClickHouse (offline). `query` feeds next_ingest_version /
+    present_ciks a trivial result; nothing here hits the network."""
+    import fintin.cli.app as app_mod
+
+    class _DummyCH:
+        def query(self, *a, **k):
+            class _R:
+                result_rows = [[0]]
+
+            return _R()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(app_mod, "check_connection", lambda cfg, **k: "test-version")
+    monkeypatch.setattr(app_mod, "get_client", lambda cfg, **k: _DummyCH())
+
+
+def _raise(exc):
+    def _f(*a, **k):
+        raise exc
+
+    return _f
+
+
+def test_backfill_throttle_aborts_with_exit_1(tmp_path, monkeypatch):
+    # AC-4 / SM-C1: an EDGAR throttle propagated from the engine maps to a loud
+    # exit 1 at the CLI boundary — the ban-safety wiring, asserted offline.
+    import fintin.core.backfill as bf_mod
+    from fintin.adapters.edgar.client import EdgarThrottleError
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        bf_mod, "backfill_universe", _raise(EdgarThrottleError("throttled after retries"))
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "throttled" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_backfill_systemic_abort_exits_1(tmp_path, monkeypatch):
+    # A BackfillAborted (too many consecutive failures — e.g. store down) maps to
+    # exit 1, not a green "complete" with hundreds of gaps.
+    import fintin.core.backfill as bf_mod
+    from fintin.core.backfill import BackfillAborted
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        bf_mod,
+        "backfill_universe",
+        _raise(BackfillAborted("backfill aborted after 10 consecutive failures")),
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "consecutive failures" in result.output
+    assert "Traceback" not in result.output

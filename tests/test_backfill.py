@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from fintin.core.backfill import (
+    BackfillAborted,
     BackfillEvent,
     BackfillFailure,
     BackfillReport,
@@ -105,9 +106,10 @@ def test_ingests_each_company_committing_per_company():
     assert report.rows_landed == 3  # 2 for CIK 1 + 1 for CIK 2
     # Per-company commit grain (AD-11): one insert call per ingested company.
     assert len(batches) == 2
-    # The shared per-run version is stamped on every landed row (AD-6).
-    assert {r.version for r in rows} == {7}
-    assert report.version == 7
+    # Version is the run base offset by sorted position (AD-6 + deterministic
+    # cross-company tie-break): CIK 1 (pos 0) → 7, CIK 2 (pos 1) → 8.
+    assert {r.cik: r.version for r in rows} == {1: 7, 2: 8}
+    assert report.version == 7  # the base for the run
 
 
 def test_report_is_backfill_report_with_no_gaps_when_all_succeed():
@@ -175,10 +177,12 @@ def test_records_failure_and_continues():
     assert strat.calls == [1, 2]  # the run continued past the failure
 
 
-def test_no_facts_company_is_a_recorded_gap_not_a_crash():
+def test_zero_row_company_is_a_clean_ingest_not_a_failure():
     # A company that yields zero facts lands zero rows but is NOT a failure — it's
-    # a clean ingest of an empty set. (NoCompanyFactsError, by contrast, raises and
-    # is recorded — covered by the failure test above via a generic error.)
+    # a clean ingest of an empty set (folded into companies_ingested, rows_landed
+    # 0). Note the resume consequence (see deferred-work.md): with 0 rows it never
+    # becomes "present", so a later run re-fetches it. (NoCompanyFactsError, by
+    # contrast, raises and is recorded as a failure — covered above.)
     strat = _FakeStrategy(facts_by_cik={1: []})
     insert, batches, rows = _capturing_insert()
     report = backfill_universe(
@@ -224,6 +228,113 @@ def test_non_fatal_error_type_is_recorded_when_not_in_fatal_errors():
     assert report.companies_failed == 1
     assert report.companies_ingested == 1
     assert strat.calls == [1, 2]
+
+
+# --- circuit breaker: systemic failure aborts (SM-C1) --------------------------
+
+
+def test_circuit_breaker_aborts_after_consecutive_failures():
+    # A systemic failure (e.g. store down mid-run) must abort, not launder every
+    # remaining company into a gap while still fetching from EDGAR.
+    strat = _FakeStrategy(fail={1, 2, 3, 4, 5})
+    insert, _, _ = _capturing_insert()
+    with pytest.raises(BackfillAborted):
+        backfill_universe(
+            [1, 2, 3, 4, 5],
+            strategy=strat,
+            insert_rows=insert,
+            taxonomy_version="v",
+            version=1,
+            max_consecutive_failures=2,
+        )
+    assert strat.calls == [1, 2]  # aborted at the 2nd failure — 3,4,5 never fetched
+
+
+def test_consecutive_failure_counter_resets_on_success():
+    # A success between failures resets the counter, so scattered failures don't
+    # trip the breaker.
+    strat = _FakeStrategy(facts_by_cik={2: _facts(2)}, fail={1, 3})
+    insert, _, _ = _capturing_insert()
+    report = backfill_universe(
+        [1, 2, 3],  # fail, success (resets), fail
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        max_consecutive_failures=2,
+    )
+    assert report.companies_failed == 2
+    assert report.companies_ingested == 1
+    assert strat.calls == [1, 2, 3]  # no abort
+
+
+def test_skips_are_neutral_to_the_consecutive_counter():
+    # A skip neither increments nor resets the counter, so fail→skip→fail still
+    # trips a threshold of 2 (the skip does not rescue a systemic failure).
+    strat = _FakeStrategy(fail={1, 3})
+    insert, _, _ = _capturing_insert()
+    with pytest.raises(BackfillAborted):
+        backfill_universe(
+            [1, 2, 3],
+            strategy=strat,
+            insert_rows=insert,
+            taxonomy_version="v",
+            version=1,
+            already_present={2},  # 2 is skipped between the two failures
+            max_consecutive_failures=2,
+        )
+    assert strat.calls == [1, 3]  # 2 skipped (never fetched); aborted at 3
+
+
+def test_no_circuit_breaker_by_default():
+    # Default (None) preserves record-and-continue for every company.
+    strat = _FakeStrategy(fail={1, 2, 3})
+    insert, _, _ = _capturing_insert()
+    report = backfill_universe(
+        [1, 2, 3], strategy=strat, insert_rows=insert, taxonomy_version="v", version=1
+    )
+    assert report.companies_failed == 3  # all recorded, no abort
+
+
+# --- deterministic per-company version (co-filed accession collision) ----------
+
+
+def test_version_is_base_offset_by_sorted_position():
+    # Each company gets base + its sorted position, so a globally-shared accession
+    # across two companies resolves deterministically (higher position wins),
+    # never by ReplacingMergeTree's arbitrary equal-version tie-break.
+    strat = _FakeStrategy(facts_by_cik={5: _facts(5), 9: _facts(9), 2: _facts(2)})
+    insert, _, rows = _capturing_insert()
+    backfill_universe(
+        [9, 5, 2],  # unsorted input
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=100,
+    )
+    # sorted order 2,5,9 → positions 0,1,2 → versions 100,101,102
+    assert {r.cik: r.version for r in rows} == {2: 100, 5: 101, 9: 102}
+
+
+# --- observer robustness -------------------------------------------------------
+
+
+def test_observer_exception_does_not_sink_the_run():
+    strat = _FakeStrategy(facts_by_cik={1: _facts(1), 2: _facts(2)})
+    insert, _, _ = _capturing_insert()
+
+    def _bad_observer(event):
+        raise RuntimeError("logging handler blew up")
+
+    report = backfill_universe(
+        [1, 2],
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        on_company=_bad_observer,
+    )
+    assert report.companies_ingested == 2  # a bad observer did not abort the run
 
 
 # --- determinism + dedup + events ----------------------------------------------

@@ -254,3 +254,13 @@ def test_present_ciks_returns_present_subset(schema_client):
 def test_present_ciks_empty_is_empty_no_query(schema_client):
     insert_raw_facts(schema_client, [_row(content_hash="a")])
     assert present_ciks(schema_client, ciks=[]) == set()
+
+
+def test_present_ciks_empty_short_circuits_without_a_query():
+    # No container needed: the empty-input guard must return set() WITHOUT issuing
+    # a query (a fake client whose .query raises proves the short-circuit).
+    class _NoQuery:
+        def query(self, *a, **k):
+            raise AssertionError("present_ciks must not query for empty ciks")
+
+    assert present_ciks(_NoQuery(), ciks=[]) == set()

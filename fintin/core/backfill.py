@@ -44,6 +44,13 @@ class BackfillStrategy(Protocol):
         ...
 
 
+class BackfillAborted(Exception):
+    """The run aborted mid-loop because too many companies failed in a row — a
+    systemic problem (e.g. the store went down after the pre-flight check), not a
+    per-company data gap. Raised rather than laundering every remaining company
+    into a recorded gap while still hitting EDGAR (SM-C1) and exiting 0."""
+
+
 class BackfillFailure(NamedTuple):
     """A company that could not be ingested — a recorded explained gap (SM-2),
     never a silent omission. ``reason`` is a human-readable cause."""
@@ -98,8 +105,14 @@ def _emit(
     index: int,
     total: int,
 ) -> None:
-    if on_company is not None:
+    if on_company is None:
+        return
+    try:
         on_company(BackfillEvent(cik=cik, outcome=outcome, index=index, total=total))
+    except Exception:
+        # A passive progress observer must never sink an in-flight run whose
+        # earlier companies are already committed. Swallow its errors.
+        pass
 
 
 def backfill_universe(
@@ -111,6 +124,7 @@ def backfill_universe(
     version: int,
     already_present: Container[int] = frozenset(),
     fatal_errors: tuple[type[BaseException], ...] = (),
+    max_consecutive_failures: int | None = None,
     on_company: Callable[[BackfillEvent], None] | None = None,
 ) -> BackfillReport:
     """Ingest each in-scope company's full history, committing per company (AD-11).
@@ -118,23 +132,33 @@ def backfill_universe(
     Iterates the de-duplicated CIKs in sorted order (deterministic — kboss). A CIK
     already in ``already_present`` is skipped **without calling the strategy** (no
     fetch — SM-C1). Each remaining company is ingested via the injected
-    ``strategy`` + ``insert_rows`` (reusing :func:`ingest_company`); a shared
-    per-run ``version`` is stamped on every row (safe: company identity keys are
-    disjoint, so a shared version cannot collide across companies).
+    ``strategy`` + ``insert_rows`` (reusing :func:`ingest_company`). The stamped
+    ``version`` is ``version + <sorted position>`` — one base per run, offset per
+    company so that if two co-registrants share a globally-identical accession
+    (the dedup key excludes CIK) the collision resolves *deterministically*
+    (higher position wins) rather than by ReplacingMergeTree's arbitrary
+    equal-version tie-break. A later resume run derives a strictly greater base,
+    so supersession (AD-6) still holds.
 
     A per-company error is recorded as a :class:`BackfillFailure` and the run
-    continues (SM-2) — except any type in ``fatal_errors`` propagates and aborts
-    the run (e.g. EDGAR throttle exhausted; ban-safety over completeness, SM-C1).
-    ``on_company``, if given, is called once per company with a
-    :class:`BackfillEvent` (the engine does no I/O itself).
+    continues (SM-2) — except (a) any type in ``fatal_errors`` propagates and
+    aborts immediately (e.g. EDGAR throttle exhausted; ban-safety, SM-C1), and
+    (b) if ``max_consecutive_failures`` is set and that many companies fail in an
+    unbroken row, :class:`BackfillAborted` is raised — a systemic failure (e.g.
+    the store dropped) must not be laundered into hundreds of per-company gaps
+    while still spending EDGAR requests. ``on_company``, if given, is called once
+    per company with a :class:`BackfillEvent` (the engine does no I/O itself; an
+    observer error can't sink the run).
     """
     ordered = sorted({int(c) for c in ciks})
     total = len(ordered)
     ingested: list[IngestResult] = []
     skipped: list[int] = []
     failures: list[BackfillFailure] = []
+    consecutive = 0  # unbroken run of failures (skips are neutral)
 
-    for index, cik in enumerate(ordered, start=1):
+    for position, cik in enumerate(ordered):
+        index = position + 1  # 1-based, for the progress event
         if cik in already_present:
             skipped.append(cik)
             _emit(on_company, cik, "skipped", index, total)
@@ -145,16 +169,28 @@ def backfill_universe(
                 fetch_facts=strategy.company_facts,
                 insert_rows=insert_rows,
                 taxonomy_version=taxonomy_version,
-                version=version,
+                version=version + position,  # deterministic per-company version
             )
         except fatal_errors:  # e.g. EDGAR throttle exhausted → abort the whole run
             raise
         except Exception as exc:  # per-company failure: recorded, not fatal (SM-2)
-            failures.append(BackfillFailure(cik, f"{type(exc).__name__}: {exc}"))
+            reason = f"{type(exc).__name__}: {exc}"
+            failures.append(BackfillFailure(cik, reason))
             _emit(on_company, cik, "failed", index, total)
+            consecutive += 1
+            if (
+                max_consecutive_failures is not None
+                and consecutive >= max_consecutive_failures
+            ):
+                raise BackfillAborted(
+                    f"backfill aborted after {consecutive} consecutive failures "
+                    f"(last: CIK {cik} — {reason}); likely a systemic problem "
+                    f"(e.g. the store) rather than per-company data gaps"
+                )
             continue
         ingested.append(result)
         _emit(on_company, cik, "ingested", index, total)
+        consecutive = 0
 
     return BackfillReport(
         ingested=tuple(ingested),
