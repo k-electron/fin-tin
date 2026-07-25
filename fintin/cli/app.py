@@ -42,8 +42,7 @@ _MAX_CONSECUTIVE_FAILURES = 10
 def _root() -> None:
     """fin-tin — local EDGAR financial-statement query tool.
 
-    A no-op root callback so the CLI stays a multi-command group (recover
-    arrives in a later story).
+    A no-op root callback that keeps the CLI a multi-command group.
     """
 
 
@@ -1008,6 +1007,156 @@ def status_command(
                 typer.secho(f"  - {gap.identifier}: {gap.reason}", fg=typer.colors.YELLOW)
             for cik in report.zero_fact_ciks:
                 typer.secho(f"  - CIK {cik}: no facts in store", fg=typer.colors.YELLOW)
+
+
+@app.command("recover")
+def recover_command(
+    cik: int = typer.Option(
+        ..., "--cik", help="SEC CIK to re-fetch and rebuild from EDGAR (e.g. 320193)."
+    ),
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+) -> None:
+    """Repair one company: re-fetch its facts from EDGAR and rebuild Tier 0 -> Tier 1 -> mart.
+
+    A scoped re-ingest (FR-6, AD-14): re-lands the company's companyfacts into
+    Tier 0 through the one rate-limited client — superseding a corrupt/lost prior
+    copy (on matching identity keys) with a higher ingest-monotonic version — then
+    re-derives its canonical Tier 1 (which flows to the resolution MV and the wide
+    mart). Manually targeted (no auto-detection); reuses the existing ingest
+    machinery and the shared single-flight lease. Needs no universe config; targets
+    any CIK."""
+    _configure_logging()
+    # Heavy `edgar` imports deferred so --help / config-error paths stay fast.
+    from fintin.adapters.edgar.client import (
+        EdgarClient,
+        EdgarConfigError,
+        EdgarThrottleError,
+    )
+    from fintin.adapters.edgar.facts import (
+        NoCompanyFactsError,
+        edgartools_version,
+        fetch_company_facts,
+    )
+    from fintin.adapters.lease.file_lease import FileLease
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        next_canonical_version,
+    )
+    from fintin.adapters.store.raw_fact_repo import (
+        insert_raw_facts,
+        next_ingest_version,
+        read_raw_facts,
+    )
+    from fintin.core.lease import run_single_flight
+    from fintin.core.recover import recover_company
+
+    # Validate the CIK before any work — cik is UInt32 in the store, and a bad
+    # value would otherwise waste an EDGAR fetch before failing at insert.
+    if not (1 <= cik <= 4_294_967_295):
+        typer.secho(
+            f"Invalid CIK {cik}: must be between 1 and 4294967295.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Recovery hits EDGAR — build the rate-limited client (its gate rejects a
+    # blank/placeholder email before any request; ban-safety, FR-1).
+    try:
+        edgar_client = EdgarClient(cfg)
+    except EdgarConfigError as exc:
+        typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    logger.info("Recovering CIK %s (database=%s)", cik, cfg.clickhouse.database)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    def _run():
+        # All EDGAR-touching work lives here so the single-flight guard can gate it:
+        # a coalesced trigger never invokes _run, so it issues no EDGAR request.
+        client = get_client(cfg.clickhouse)
+        try:
+            # Store-derived monotonic versions (AD-6): the re-ingest/re-map supersede
+            # any corrupt prior copy on FINAL/argMax reads.
+            raw_version = next_ingest_version(client)
+            canonical_version = next_canonical_version(client)
+            return recover_company(
+                cik,
+                fetch_facts=lambda c: fetch_company_facts(edgar_client, c),
+                insert_raw_rows=lambda rows: insert_raw_facts(client, rows),
+                read_raw_facts=lambda c: read_raw_facts(client, c),
+                insert_canonical_rows=lambda rows: insert_canonical_facts(client, rows),
+                taxonomy_version=edgartools_version(),
+                raw_version=raw_version,
+                canonical_version=canonical_version,
+            )
+        finally:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    # Single-flight (AD-12): recover shares the one lease with catch-up/backfill —
+    # a live run holding it → ALREADY_RUNNING with no EDGAR request.
+    lease = FileLease(
+        cfg.lease.path,
+        ttl_seconds=cfg.lease.ttl_seconds,
+        heartbeat_seconds=cfg.lease.heartbeat_seconds,
+    )
+    try:
+        report = run_single_flight(lease, _run)
+    except NoCompanyFactsError as exc:
+        typer.secho(str(exc), fg=typer.colors.YELLOW, err=True)
+        raise typer.Exit(code=1)
+    except EdgarThrottleError as exc:
+        typer.secho(
+            f"EDGAR throttled, recovery aborted: {exc}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+    except Exception as exc:  # fetch/insert error (connection already verified)
+        typer.secho(f"Recovery failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    # A live run already holds the shared lease → coalesce (ALREADY_RUNNING, exit 0).
+    if report is None:
+        typer.secho(
+            "Another run is already active — ALREADY_RUNNING "
+            "(nothing to do; no EDGAR request issued).",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    # Honest reporting: when EDGAR returned nothing ingestable, don't claim a
+    # re-ingest/re-derivation that didn't happen — Tier 0 is left as it was.
+    if report.rows_landed == 0:
+        typer.secho(
+            f"Recover CIK {cik}: EDGAR returned no ingestable facts — Tier 0 left "
+            f"unchanged ({report.projected} row(s) re-projected to Tier 1 from "
+            f"existing data) in database '{cfg.clickhouse.database}'.",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    typer.secho(
+        f"Recovered CIK {cik}: {report.rows_landed} facts re-ingested into Tier 0, "
+        f"{report.projected} projected to canonical Tier 1 "
+        f"(resolution + mart re-derived) in database '{cfg.clickhouse.database}'.",
+        fg=typer.colors.GREEN,
+    )
 
 
 def main() -> None:

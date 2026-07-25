@@ -1,5 +1,16 @@
 # Deferred Work
 
+## Deferred from: code review of story-3.3 (2026-07-25)
+
+- **Partial-recovery inconsistency window (Tier 0 re-landed, Tier 1 re-map raised)** (low, self-healing) — `recover` re-ingests Tier 0 then re-maps Tier 1 as two sequential store operations (not one transaction). If `ingest_company` commits the fresh Tier 0 but `map_company` then raises (a read/project/insert error), the run exits 1 with Tier 0 advanced but Tier 1 (and thus the resolution MV / mart) NOT re-derived — a transient split. Not silent corruption: a re-run re-ingests (strictly higher version) and re-maps, so it self-heals; and ClickHouse has no cross-statement transaction to wrap this in anyway. Revisit (surface a "Tier 0 advanced; re-run to finish re-deriving Tier 1" hint on the failure) only if operators hit it.
+- **Read-after-write correctness rests on synchronous inserts** (low, latent) — `recover` (and `ingest-company`→`map-canonical` run back-to-back) relies on the just-inserted Tier 0 rows being visible to the subsequent `raw_fact FINAL` read on the same client. `adapters/store/client.py` configures no `async_insert`, so ClickHouse's default synchronous insert guarantees this today. If `async_insert=1` is ever adopted, the re-map could read stale Tier 0 and re-project the corrupt copy — add a `wait_for_async_insert` / sync barrier between the ingest and the re-map at that point.
+
+## Deferred from: story-3.3 (2026-07-24, scoped recovery)
+
+- **`--accession`-scoped recovery** (deferred, AD-13) — `fintin recover --cik X` recovers a whole company (re-fetches its full `companyfacts`); recovering a *single accession* would need a per-accession fetch strategy, which is the same deferred item as Story 3.1's "narrower per-accession fetch vs full `companyfacts`" (v1's only fetch is per-company `companyfacts`). The pure `recover_company` engine and the CLI are already shaped so an `--accession` flag + a per-accession fetch drop in without a redesign. Revisit with the per-accession fetch strategy.
+- **Automated corruption *detection* / at-rest scrub is out of v1 scope** (Should/Won't, by design — AC-3) — recovery is **manually invoked** with an explicit `--cik`; there is no scheduled scrub or "this number looks wrong" detector. Per the architecture (Deferred): the periodic at-rest integrity scrub is a "Should" and ad-hoc reactive-repair *detection* is a "Won't" for v1. The **repair** path itself (a scoped re-ingest superseding by version, AD-6/AD-14) is FR-6 and is delivered here. Revisit the scrub if at-rest corruption is ever observed; recovery is already the fix once a target is known.
+- **Recovery re-fetches the full `companyfacts` and re-maps the whole company** — like catch-up, a targeted recover re-downloads the company's entire history (one request) and re-projects all of its Tier 0 → Tier 1, even to repair one bad fact (idempotent, bounded — one company). The narrower per-accession/per-fact repair rides on the deferred per-accession fetch above.
+
 ## Resolved by / Deferred from: story-3.2 (2026-07-24, single-flight lease)
 
 **Resolved by Story 3.2** (the AD-12 filesystem lease with a background heartbeat thread wired into both `catch-up` and `backfill`):
