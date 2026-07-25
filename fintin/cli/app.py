@@ -519,6 +519,162 @@ def work_list_command(
             )
 
 
+@app.command("backfill")
+def backfill_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Re-ingest companies already present (bypass the resume-skip); "
+        "supersedes prior values on read (cannot retract facts removed since).",
+    ),
+    show_gaps: bool = typer.Option(
+        False,
+        "--show-gaps",
+        help="List each company recorded as an explained gap (cik, reason).",
+    ),
+) -> None:
+    """Backfill the Universe's full history into Tier 0, resumably (per-company).
+
+    Ingests each in-scope company's entire `companyfacts` history through the one
+    rate-limited client, committing per company. Re-running skips companies
+    already in the store (no checkpoint file), so an interrupted backfill resumes.
+    A per-company failure is a recorded explained gap, not fatal; only an EDGAR
+    throttle aborts the run (ban-safety). Run `fintin schema-init` first."""
+    _configure_logging()
+    # Heavy `edgar` imports deferred so --help / config-error paths stay fast.
+    from fintin.adapters.edgar.backfill import CompanyFactsStrategy
+    from fintin.adapters.edgar.client import (
+        EdgarClient,
+        EdgarConfigError,
+        EdgarThrottleError,
+    )
+    from fintin.adapters.edgar.facts import edgartools_version
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.adapters.store.raw_fact_repo import (
+        insert_raw_facts,
+        next_ingest_version,
+        present_ciks,
+    )
+    from fintin.core.backfill import BackfillAborted, backfill_universe
+    from fintin.core.universe import resolve_universe
+
+    # Abort the run if this many companies fail in an unbroken row — a systemic
+    # failure (e.g. the store dropped mid-run) must not be laundered into per-
+    # company gaps while still spending EDGAR requests (SM-C1).
+    max_consecutive_failures = 10
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    if cfg.universe is None:
+        typer.secho(
+            f"Config error: no [universe] section in {config} — define the Universe first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Backfill hits EDGAR — build the rate-limited client ONCE (reused across every
+    # company; a second construction would reset process-global edgar rate state).
+    # Its gate rejects a blank/placeholder email before any request (ban-safety, FR-1).
+    try:
+        edgar_client = EdgarClient(cfg)
+    except EdgarConfigError as exc:
+        typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Universe resolution is offline (Story 2.1). It can still fail on a degraded
+    # edgartools install (unreadable bundled reference table) — render it cleanly,
+    # never as a traceback.
+    try:
+        resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    except Exception as exc:
+        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    # An empty resolved Universe is a hard misconfiguration for a backfill scope.
+    if not resolved.ciks:
+        typer.secho(
+            "Resolved Universe is empty — check the [universe] tickers/ciks.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    def _log_company(event) -> None:
+        logger.info(
+            "[%d/%d] CIK %s %s", event.index, event.total, event.cik, event.outcome
+        )
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # One ingest-monotonic version base per run (AD-6); the engine offsets it
+        # per company so a shared cross-company accession resolves deterministically.
+        version = next_ingest_version(client)
+        # Resume: skip companies already present (derived from the store, not a
+        # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
+        present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
+        report = backfill_universe(
+            resolved.ciks,
+            strategy=CompanyFactsStrategy(edgar_client),
+            insert_rows=lambda rows: insert_raw_facts(client, rows),
+            taxonomy_version=edgartools_version(),
+            version=version,
+            already_present=present,
+            fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
+            max_consecutive_failures=max_consecutive_failures,
+            on_company=_log_company,
+        )
+    except EdgarThrottleError as exc:
+        typer.secho(
+            f"EDGAR throttled, backfill aborted: {exc}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+    except BackfillAborted as exc:  # systemic failure (e.g. store down) — stop
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:  # setup/query error (connection already verified)
+        typer.secho(f"Backfill failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    noun = "company" if report.companies_ingested == 1 else "companies"
+    typer.secho(
+        f"Backfill complete: {report.companies_ingested} {noun} ingested "
+        f"({report.rows_landed} facts landed), "
+        f"{report.companies_skipped} already present, "
+        f"{report.companies_failed} failed "
+        f"into database '{cfg.clickhouse.database}'.",
+        fg=typer.colors.GREEN,
+    )
+    if report.failures:
+        typer.secho(
+            f"{report.companies_failed} company(ies) recorded as explained gaps.",
+            fg=typer.colors.YELLOW,
+        )
+        if show_gaps:
+            for gap in report.failures:
+                typer.secho(f"  - CIK {gap.cik}: {gap.reason}", fg=typer.colors.YELLOW)
+
+
 def main() -> None:
     app()
 
