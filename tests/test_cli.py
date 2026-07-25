@@ -347,7 +347,7 @@ def test_backfill_systemic_abort_exits_1(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bf_mod,
         "backfill_universe",
-        _raise(BackfillAborted("backfill aborted after 10 consecutive failures")),
+        _raise(BackfillAborted("run aborted after 10 consecutive failures")),
     )
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
@@ -464,16 +464,77 @@ def test_catch_up_systemic_abort_exits_1(tmp_path, monkeypatch):
 
     _stub_store(monkeypatch)
     monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    # Use the engine's real command-neutral abort wording (backfill_universe is
+    # shared by both commands) so the test reflects production output, not a
+    # fabricated "catch-up aborted…"/"backfill aborted…" string.
     monkeypatch.setattr(
         cu_mod,
         "catch_up",
-        _raise(BackfillAborted("catch-up aborted after 10 consecutive failures")),
+        _raise(
+            BackfillAborted(
+                "run aborted after 10 consecutive failures (last: CIK 320193 — "
+                "RuntimeError: store down); likely a systemic problem "
+                "(e.g. the store) rather than per-company data gaps"
+            )
+        ),
     )
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
     result = runner.invoke(app, ["catch-up", "--config", str(p)])
     assert result.exit_code == 1
     assert "consecutive failures" in result.output
+    assert "backfill" not in result.output.lower()  # no wrong-command wording
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_completed_renders_summary_and_gaps_exit_0(tmp_path, monkeypatch):
+    # The COMPLETED render branch needs no live EDGAR — it renders purely from a
+    # CatchUpReport. Monkeypatch the engine to RETURN a hand-built COMPLETED report
+    # (1 ingested, 1 recorded gap) and assert the GREEN summary + YELLOW gap line +
+    # --show-gaps enumeration + exit 0. (Guards the success-render f-strings that
+    # the throttle/systemic/NOTHING_TO_DO branches don't exercise.)
+    import fintin.adapters.edgar.filings_index as fi_mod
+    import fintin.core.catchup as cu_mod
+    from fintin.core.backfill import BackfillFailure, BackfillReport
+    from fintin.core.catchup import CatchUpReport, CatchUpStatus
+    from fintin.core.ingest import IngestResult
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    ingested = IngestResult(
+        cik=2,
+        facts_seen=3,
+        rows_landed=3,
+        dropped_dimensional=0,
+        dropped_non_standard=0,
+        dropped_non_numeric=0,
+        dropped_incomplete=0,
+        deduped=0,
+        version=1,
+    )
+    report = CatchUpReport(
+        status=CatchUpStatus.COMPLETED,
+        scanned=4,
+        outstanding=2,
+        companies=2,
+        backfill=BackfillReport(
+            ingested=(ingested,),
+            skipped=(),
+            failures=(BackfillFailure(1, "RuntimeError: boom"),),
+            version=1,
+        ),
+    )
+    monkeypatch.setattr(cu_mod, "catch_up", lambda *a, **k: report)
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p), "--show-gaps"])
+    assert result.exit_code == 0
+    assert "Catch-up complete (STARTED→COMPLETED)" in result.output
+    assert "1 company ingested" in result.output  # companies_ingested == 1 → singular
+    assert "3 facts landed" in result.output
+    assert "2 outstanding filing(s)" in result.output
+    assert "recorded as explained gaps" in result.output
+    assert "CIK 1: RuntimeError: boom" in result.output  # --show-gaps enumeration
     assert "Traceback" not in result.output
 
 

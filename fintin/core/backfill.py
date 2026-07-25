@@ -183,7 +183,7 @@ def backfill_universe(
                 and consecutive >= max_consecutive_failures
             ):
                 raise BackfillAborted(
-                    f"backfill aborted after {consecutive} consecutive failures "
+                    f"run aborted after {consecutive} consecutive failures "
                     f"(last: CIK {cik} — {reason}); likely a systemic problem "
                     f"(e.g. the store) rather than per-company data gaps"
                 )

@@ -30,6 +30,7 @@ from typing import NamedTuple
 
 from fintin.core.backfill import (
     BackfillEvent,
+    BackfillFailure,
     BackfillReport,
     BackfillStrategy,
     backfill_universe,
@@ -75,7 +76,7 @@ class CatchUpReport(NamedTuple):
         return self.backfill.rows_landed if self.backfill is not None else 0
 
     @property
-    def failures(self) -> tuple:
+    def failures(self) -> tuple[BackfillFailure, ...]:
         return self.backfill.failures if self.backfill is not None else ()
 
 

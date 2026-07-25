@@ -31,6 +31,12 @@ app = typer.Typer(
 
 logger = logging.getLogger("fintin")
 
+# Abort a backfill/catch-up run if this many companies fail in an unbroken row — a
+# systemic failure (e.g. the store dropped mid-run) must not be laundered into per-
+# company gaps while the run keeps spending EDGAR requests it can't persist (SM-C1).
+# Single-sourced so the two ban-safety triggers can't drift apart.
+_MAX_CONSECUTIVE_FAILURES = 10
+
 
 @app.callback()
 def _root() -> None:
@@ -563,11 +569,6 @@ def backfill_command(
     from fintin.core.backfill import BackfillAborted, backfill_universe
     from fintin.core.universe import resolve_universe
 
-    # Abort the run if this many companies fail in an unbroken row — a systemic
-    # failure (e.g. the store dropped mid-run) must not be laundered into per-
-    # company gaps while still spending EDGAR requests (SM-C1).
-    max_consecutive_failures = 10
-
     try:
         cfg = load_config(config)
     except ConfigError as exc:
@@ -636,7 +637,7 @@ def backfill_command(
             version=version,
             already_present=present,
             fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
-            max_consecutive_failures=max_consecutive_failures,
+            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
             on_company=_log_company,
         )
     except EdgarThrottleError as exc:
@@ -716,15 +717,10 @@ def catch_up_command(
         next_ingest_version,
         present_accessions,
     )
-    from fintin.core.backfill import BackfillAborted
+    from fintin.core.backfill import BackfillAborted, BackfillEvent
     from fintin.core.catchup import CatchUpStatus, catch_up
     from fintin.core.reconcile import compute_work_list, resolve_window
     from fintin.core.universe import resolve_universe
-
-    # Abort the run if this many companies fail in an unbroken row — a systemic
-    # failure (e.g. the store dropped mid-run) must not be laundered into per-
-    # company gaps while still spending EDGAR requests (SM-C1). Same as backfill.
-    max_consecutive_failures = 10
 
     try:
         cfg = load_config(config)
@@ -772,12 +768,12 @@ def catch_up_command(
         typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
 
-    def _log_company(event) -> None:
+    def _log_company(event: BackfillEvent) -> None:
         logger.info(
             "[%d/%d] CIK %s %s", event.index, event.total, event.cik, event.outcome
         )
 
-    def _log_status(status) -> None:
+    def _log_status(status: CatchUpStatus) -> None:
         logger.info("catch-up: %s", status.value)
 
     client = None
@@ -809,7 +805,7 @@ def catch_up_command(
             taxonomy_version=edgartools_version(),
             version=version,
             fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
-            max_consecutive_failures=max_consecutive_failures,
+            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
             on_company=_log_company,
             on_status=_log_status,
         )
