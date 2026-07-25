@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 from typer.testing import CliRunner
 
+from fintin.cli import app as app_mod
 from fintin.cli.app import app
 
 runner = CliRunner()
@@ -1046,3 +1047,61 @@ def test_status_fully_covered_has_no_gap_line(tmp_path, status_db, local_clickho
     assert "2024-05-01" in res.output
     assert "explained gap" not in res.output  # fully covered → no gap line at all
     assert "Traceback" not in res.output
+
+
+# --- --debug traceback escape hatch (cross-command) ----------------------------
+# Every command's terminal `except Exception` renders a friendly one-liner and
+# discards the stack. `--debug` recovers it without changing the default UX.
+# `schema-init` stands in for all 13 handlers — they share one funnel
+# (`_fail_unexpected`), so testing the funnel once covers the family.
+
+
+def _boom(*_args, **_kwargs):
+    raise RuntimeError("boom")
+
+
+def _schema_init_that_faults(tmp_path, monkeypatch):
+    """A `schema-init` whose DDL step raises an unexpected error: connection and
+    client are stubbed so the fault lands in the generic handler, not a typed one."""
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)
+    monkeypatch.setattr(app_mod, "check_connection", lambda cfg: "24.1")
+    monkeypatch.setattr(app_mod, "get_client", lambda cfg: None)
+    monkeypatch.setattr(app_mod.store_schema, "create_schema", _boom)
+    return p
+
+
+def test_unexpected_error_shows_one_liner_not_a_traceback(tmp_path, monkeypatch):
+    """Default UX is unchanged: a one-line message, never a raw traceback."""
+    p = _schema_init_that_faults(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["schema-init", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "Schema init failed: boom" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_debug_flag_recovers_the_discarded_traceback(tmp_path, monkeypatch, caplog):
+    """`--debug` logs the stack the friendly one-liner would otherwise throw away,
+    while stderr still shows the same one-liner."""
+    p = _schema_init_that_faults(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["--debug", "schema-init", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "Schema init failed: boom" in result.output  # friendly line unchanged
+    assert "Traceback (most recent call last)" in caplog.text  # stack preserved
+    assert "RuntimeError: boom" in caplog.text
+    assert "Traceback" not in result.output  # and it stays out of the user's face
+
+
+def test_without_debug_the_traceback_is_not_logged(tmp_path, monkeypatch, caplog):
+    """Negative control: the stack really is suppressed by default, so the test
+    above is exercising the flag rather than an unconditional `exc_info=True`."""
+    p = _schema_init_that_faults(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["schema-init", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "Traceback (most recent call last)" not in caplog.text
+
+
+def test_debug_flag_is_documented_in_help():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "--debug" in result.output

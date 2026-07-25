@@ -38,12 +38,29 @@ logger = logging.getLogger("fintin")
 _MAX_CONSECUTIVE_FAILURES = 10
 
 
+# Set by the root `--debug` flag (or FINTIN_DEBUG=1). The CLI never prints a raw
+# traceback (SPINE Consistency Conventions), so by default an unexpected fault's
+# stack is logged at DEBUG and therefore discarded; --debug raises fin-tin's own
+# logger to DEBUG to recover it without changing the default UX.
+_debug_enabled = False
+
+
 @app.callback()
-def _root() -> None:
+def _root(
+    debug: bool = typer.Option(
+        False,
+        "--debug",
+        envvar="FINTIN_DEBUG",
+        help="Log full tracebacks for unexpected errors (or set FINTIN_DEBUG=1).",
+    ),
+) -> None:
     """fin-tin — local EDGAR financial-statement query tool.
 
-    A no-op root callback that keeps the CLI a multi-command group.
+    A root callback that keeps the CLI a multi-command group and carries the
+    global --debug switch.
     """
+    global _debug_enabled
+    _debug_enabled = debug
 
 
 def _configure_logging() -> None:
@@ -52,6 +69,24 @@ def _configure_logging() -> None:
         stream=sys.stdout,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    # Only fin-tin's own logger — third-party DEBUG chatter (edgar, httpx,
+    # clickhouse_connect) would bury the traceback we came for. Set both ways so
+    # the level never latches on across calls within one process.
+    logger.setLevel(logging.DEBUG if _debug_enabled else logging.NOTSET)
+
+
+def _fail_unexpected(message: str, exc: Exception) -> typer.Exit:
+    """Render an unexpected fault as a one-line message, preserving its traceback.
+
+    Every command's terminal `except Exception` funnels through here: the stack
+    goes to the logger at DEBUG — recoverable with `--debug`/`FINTIN_DEBUG=1` —
+    while the user still sees the friendly one-liner the CLI conventions require
+    instead of a raw traceback. Returns the `typer.Exit` for the caller to raise,
+    so the control flow stays visible at the call site.
+    """
+    logger.debug("%s (unexpected error)", message, exc_info=True)
+    typer.secho(f"{message}: {exc}", fg=typer.colors.RED, err=True)
+    return typer.Exit(code=1)
 
 
 @app.command("check-connection")
@@ -128,8 +163,7 @@ def schema_init_command(
         client = get_client(cfg.clickhouse)
         created = store_schema.create_schema(client)
     except Exception as exc:  # DDL error (connection already verified above)
-        typer.secho(f"Schema init failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Schema init failed", exc)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -223,8 +257,7 @@ def ingest_company_command(
         typer.secho(f"EDGAR throttled, gave up: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     except Exception as exc:  # fetch/insert error (connection already verified)
-        typer.secho(f"Ingest failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Ingest failed", exc)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -300,8 +333,7 @@ def map_canonical_command(
             version=version,
         )
     except Exception as exc:  # read/project/insert error (connection already verified)
-        typer.secho(f"Projection failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Projection failed", exc)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -368,8 +400,7 @@ def universe_command(
     try:
         resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
     except Exception as exc:
-        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Universe resolution failed", exc)
 
     n = len(resolved.ciks)
     noun = "company" if n == 1 else "companies"
@@ -494,8 +525,7 @@ def work_list_command(
         typer.secho(f"EDGAR throttled, gave up: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     except Exception as exc:  # discovery/query error (connection already verified)
-        typer.secho(f"Work-list failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Work-list failed", exc)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -599,8 +629,7 @@ def backfill_command(
     try:
         resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
     except Exception as exc:
-        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Universe resolution failed", exc)
     # An empty resolved Universe is a hard misconfiguration for a backfill scope.
     if not resolved.ciks:
         typer.secho(
@@ -668,8 +697,7 @@ def backfill_command(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     except Exception as exc:  # setup/query error (connection already verified)
-        typer.secho(f"Backfill failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Backfill failed", exc)
 
     # A live run already holds the shared lease → coalesce (ALREADY_RUNNING, exit 0).
     if report is None:
@@ -776,8 +804,7 @@ def catch_up_command(
     try:
         resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
     except Exception as exc:
-        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Universe resolution failed", exc)
     # An empty resolved Universe is a hard misconfiguration for a catch-up scope.
     if not resolved.ciks:
         typer.secho(
@@ -859,8 +886,7 @@ def catch_up_command(
         typer.secho(str(exc), fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     except Exception as exc:  # discovery/ingest error (connection already verified)
-        typer.secho(f"Catch-up failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Catch-up failed", exc)
 
     # ALREADY_RUNNING is a success outcome (exit 0) — another run holds the lease.
     if report.status is CatchUpStatus.ALREADY_RUNNING:
@@ -943,8 +969,7 @@ def status_command(
     try:
         resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
     except Exception as exc:
-        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Universe resolution failed", exc)
     if not resolved.ciks:
         # Surface WHICH tickers failed before the empty-Universe error (SM-2 — this
         # is exactly the branch where the explained gaps are most useful), mirroring
@@ -976,8 +1001,7 @@ def status_command(
         hwm = high_water_mark(client)
         report = compute_coverage(resolved, present, hwm)
     except Exception as exc:  # query error (connection already verified)
-        typer.secho(f"Status failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Status failed", exc)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
@@ -1128,8 +1152,7 @@ def recover_command(
         )
         raise typer.Exit(code=1)
     except Exception as exc:  # fetch/insert error (connection already verified)
-        typer.secho(f"Recovery failed: {exc}", fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=1)
+        raise _fail_unexpected("Recovery failed", exc)
 
     # A live run already holds the shared lease → coalesce (ALREADY_RUNNING, exit 0).
     if report is None:
