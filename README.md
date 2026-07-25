@@ -192,6 +192,29 @@ The backfill strategy is pluggable: the per-company `companyfacts` API is the v1
 strategy; a bulk-download strategy for a much larger Universe can drop in behind
 the same interface with no redesign.
 
+### Check coverage & status
+
+`fintin status` reports how much of your Universe is ingested and what's still an
+explained gap — no silent omissions:
+
+```bash
+uv run fintin status              # coverage summary + gap counts
+uv run fintin status --show-gaps  # also list every explained gap
+```
+
+It reports the **count of in-scope companies present**, the **high-water mark**
+(the latest `filed_date` in the store, or a note that the store is empty), and
+every **explained gap** in two classes: unresolvable tickers from your config, and
+in-scope companies with **zero facts** in the store. A company that failed during
+backfill is exactly one absent from the store, so it shows as `no facts in store`
+(the durable, DB-derived state — the specific per-run failure reason is shown at
+backfill time by `backfill --show-gaps`).
+
+`status` is **offline** — it reads ClickHouse and the bundled reference table
+only, so it needs **no contact email** and makes no EDGAR request. Gaps don't
+change the exit code (they're a known, reported state); only a bad config or an
+unreachable store fails loudly.
+
 ## Testing
 
 ```bash
