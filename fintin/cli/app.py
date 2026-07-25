@@ -31,14 +31,19 @@ app = typer.Typer(
 
 logger = logging.getLogger("fintin")
 
+# Abort a backfill/catch-up run if this many companies fail in an unbroken row — a
+# systemic failure (e.g. the store dropped mid-run) must not be laundered into per-
+# company gaps while the run keeps spending EDGAR requests it can't persist (SM-C1).
+# Single-sourced so the two ban-safety triggers can't drift apart.
+_MAX_CONSECUTIVE_FAILURES = 10
+
 
 @app.callback()
 def _root() -> None:
     """fin-tin — local EDGAR financial-statement query tool.
 
-    A no-op root callback so the CLI stays a multi-command group even while
-    only one command exists (catch-up, backfill, status arrive in later
-    stories).
+    A no-op root callback so the CLI stays a multi-command group (recover
+    arrives in a later story).
     """
 
 
@@ -564,11 +569,6 @@ def backfill_command(
     from fintin.core.backfill import BackfillAborted, backfill_universe
     from fintin.core.universe import resolve_universe
 
-    # Abort the run if this many companies fail in an unbroken row — a systemic
-    # failure (e.g. the store dropped mid-run) must not be laundered into per-
-    # company gaps while still spending EDGAR requests (SM-C1).
-    max_consecutive_failures = 10
-
     try:
         cfg = load_config(config)
     except ConfigError as exc:
@@ -637,7 +637,7 @@ def backfill_command(
             version=version,
             already_present=present,
             fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
-            max_consecutive_failures=max_consecutive_failures,
+            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
             on_company=_log_company,
         )
     except EdgarThrottleError as exc:
@@ -662,6 +662,184 @@ def backfill_command(
         f"({report.rows_landed} facts landed), "
         f"{report.companies_skipped} already present, "
         f"{report.companies_failed} failed "
+        f"into database '{cfg.clickhouse.database}'.",
+        fg=typer.colors.GREEN,
+    )
+    if report.failures:
+        typer.secho(
+            f"{report.companies_failed} company(ies) recorded as explained gaps.",
+            fg=typer.colors.YELLOW,
+        )
+        if show_gaps:
+            for gap in report.failures:
+                typer.secho(f"  - CIK {gap.cik}: {gap.reason}", fg=typer.colors.YELLOW)
+
+
+@app.command("catch-up")
+def catch_up_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    show_gaps: bool = typer.Option(
+        False,
+        "--show-gaps",
+        help="List each company recorded as an explained gap (cik, reason).",
+    ),
+) -> None:
+    """Catch the store up to today: ingest everything filed since, committing per company.
+
+    Reuses the work-list reconciler (EDGAR's index over the lookback window minus
+    what's already in the store) to find outstanding filings, then re-ingests the
+    affected companies' full `companyfacts` through the one rate-limited client. The
+    run reports `STARTED`→`COMPLETED`, or `NOTHING_TO_DO` when the store is already
+    current (all exit-0). A per-company failure is a recorded explained gap, not
+    fatal; only an EDGAR throttle — or a systemic failure — aborts the run
+    (ban-safety). Run `fintin schema-init` first."""
+    _configure_logging()
+    # Heavy `edgar` imports deferred so --help / config-error paths stay fast.
+    from datetime import date
+
+    from fintin.adapters.edgar.backfill import CompanyFactsStrategy
+    from fintin.adapters.edgar.client import (
+        EdgarClient,
+        EdgarConfigError,
+        EdgarThrottleError,
+    )
+    from fintin.adapters.edgar.facts import edgartools_version
+    from fintin.adapters.edgar.filings_index import fetch_work_candidates
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.adapters.store.raw_fact_repo import (
+        high_water_mark,
+        insert_raw_facts,
+        next_ingest_version,
+        present_accessions,
+    )
+    from fintin.core.backfill import BackfillAborted, BackfillEvent
+    from fintin.core.catchup import CatchUpStatus, catch_up
+    from fintin.core.reconcile import compute_work_list, resolve_window
+    from fintin.core.universe import resolve_universe
+
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    if cfg.universe is None:
+        typer.secho(
+            f"Config error: no [universe] section in {config} — define the Universe first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Catch-up hits EDGAR (index + companyfacts) — build the rate-limited client
+    # ONCE (reused for discovery and every company; a second construction would
+    # reset process-global edgar rate state). Its gate rejects a blank/placeholder
+    # email before any request (ban-safety, FR-1).
+    try:
+        edgar_client = EdgarClient(cfg)
+    except EdgarConfigError as exc:
+        typer.secho(f"EDGAR config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    # Universe resolution is offline (Story 2.1). It can still fail on a degraded
+    # edgartools install — render it cleanly, never as a traceback (Story 2.3 P1).
+    try:
+        resolved = resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)
+    except Exception as exc:
+        typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    # An empty resolved Universe is a hard misconfiguration for a catch-up scope.
+    if not resolved.ciks:
+        typer.secho(
+            "Resolved Universe is empty — check the [universe] tickers/ciks.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    def _log_company(event: BackfillEvent) -> None:
+        logger.info(
+            "[%d/%d] CIK %s %s", event.index, event.total, event.cik, event.outcome
+        )
+
+    def _log_status(status: CatchUpStatus) -> None:
+        logger.info("catch-up: %s", status.value)
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        # Discovery — the exact work-list pipeline (Epic 2 reconciler, REUSED):
+        # HWM sizes the index scan window (a hint, AD-16); membership by exact
+        # accession is the authority.
+        hwm = high_water_mark(client)
+        window_start, window_end = resolve_window(
+            hwm, cfg.reconcile.lookback_days, date.today()
+        )
+        candidates = fetch_work_candidates(
+            edgar_client,
+            filing_date=f"{window_start.isoformat()}:{window_end.isoformat()}",
+            ciks=resolved.ciks,
+        )
+        present = present_accessions(
+            client, accessions={c.accession for c in candidates}
+        )
+        work = compute_work_list(candidates, present)
+        # One ingest-monotonic version base per run (AD-6); the engine offsets it
+        # per affected company.
+        version = next_ingest_version(client)
+        report = catch_up(
+            work,
+            strategy=CompanyFactsStrategy(edgar_client),
+            insert_rows=lambda rows: insert_raw_facts(client, rows),
+            taxonomy_version=edgartools_version(),
+            version=version,
+            fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
+            max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
+            on_company=_log_company,
+            on_status=_log_status,
+        )
+    except EdgarThrottleError as exc:
+        typer.secho(
+            f"EDGAR throttled, catch-up aborted: {exc}", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1)
+    except BackfillAborted as exc:  # systemic failure (e.g. store down) — stop
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:  # discovery/ingest error (connection already verified)
+        typer.secho(f"Catch-up failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    # NOTHING_TO_DO is a success outcome (exit 0) — the store is already current.
+    if report.status is CatchUpStatus.NOTHING_TO_DO:
+        typer.secho(
+            "Nothing to do — the store is already current over the "
+            f"{cfg.reconcile.lookback_days}-day lookback (NOTHING_TO_DO) "
+            f"[{report.scanned} scanned].",
+            fg=typer.colors.GREEN,
+        )
+        return
+
+    noun = "company" if report.companies_ingested == 1 else "companies"
+    typer.secho(
+        f"Catch-up complete (STARTED→COMPLETED): {report.companies_ingested} {noun} "
+        f"ingested ({report.rows_landed} facts landed) from {report.outstanding} "
+        f"outstanding filing(s), {report.companies_failed} failed, "
         f"into database '{cfg.clickhouse.database}'.",
         fg=typer.colors.GREEN,
     )

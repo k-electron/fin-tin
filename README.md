@@ -151,8 +151,8 @@ window spans — not per-company crawling), so it **hits EDGAR and needs a real
 contact email** (like ingestion). Per-accession **membership** against the store
 is the authority (already-present filings are excluded; a newly-filed amendment
 restating an old period shows up); the high-water mark only sizes the scan
-window. It's a **read-only dry-run** — it ingests nothing (catch-up lands in a
-later stage).
+window. It's a **read-only dry-run** — it ingests nothing (`fintin catch-up` does
+the ingesting, see below).
 
 ### Backfill the Universe
 
@@ -191,6 +191,37 @@ email**.
 The backfill strategy is pluggable: the per-company `companyfacts` API is the v1
 strategy; a bulk-download strategy for a much larger Universe can drop in behind
 the same interface with no redesign.
+
+### Catch up to today
+
+Once the store has been backfilled, `fintin catch-up` brings it current — ingesting
+everything filed since, any time, idempotently:
+
+```bash
+uv run fintin catch-up               # STARTED→COMPLETED, or NOTHING_TO_DO if current
+uv run fintin catch-up --show-gaps   # also list any companies recorded as explained gaps
+```
+
+It **reuses the work-list mechanism** (`fintin work-list` previews exactly what it
+will fetch): EDGAR's multi-filer index over the lookback window, minus the
+accessions already in the store. It then re-ingests the **affected companies'** full
+`companyfacts` through the same rate-limited client — so a newly-filed report, and
+any **restatement** of an older period, lands and wins on read (latest-filed-wins).
+Like backfill it **hits EDGAR and needs a real contact email**.
+
+- **Success vocabulary, all exit-0.** A non-empty run reports `STARTED`→`COMPLETED`;
+  an already-current store reports `NOTHING_TO_DO` (and makes no `companyfacts`
+  request). Neither is an error — safe to wire to a scheduler or run right before a
+  screen ("catch up, then query").
+- **Failures are explained gaps, not crashes** (`--show-gaps` lists them), exactly
+  as in backfill.
+- **Throttle / systemic abort → exit 1.** An exhausted EDGAR cool-down, or many
+  companies failing in a row (e.g. the store dropped mid-run), stops the run rather
+  than continuing — ban-safety outranks finishing.
+
+Catch-up derives its work fresh from the store + EDGAR's index every run — no cursor
+or "last run" marker (a crash just resumes on the next trigger). Guarding two
+concurrent catch-ups with a single-flight lease is a later story.
 
 ### Check coverage & status
 

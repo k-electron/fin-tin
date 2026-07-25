@@ -347,13 +347,194 @@ def test_backfill_systemic_abort_exits_1(tmp_path, monkeypatch):
     monkeypatch.setattr(
         bf_mod,
         "backfill_universe",
-        _raise(BackfillAborted("backfill aborted after 10 consecutive failures")),
+        _raise(BackfillAborted("run aborted after 10 consecutive failures")),
     )
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
     result = runner.invoke(app, ["backfill", "--config", str(p)])
     assert result.exit_code == 1
     assert "consecutive failures" in result.output
+    assert "Traceback" not in result.output
+
+
+# --- catch-up (Story 3.1) ------------------------------------------------------
+# Error paths + ban-safety wiring only. The COMPLETED happy path hits EDGAR (index
+# AND companyfacts) so it's covered offline by test_catchup / test_backfill, never
+# live (NFR-7); only the NOTHING_TO_DO branch is CLI-drivable offline (index stub).
+
+
+def test_help_lists_catch_up():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "catch-up" in result.output
+
+
+def test_catch_up_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["catch-up", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_missing_universe_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)  # no [universe]
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "[universe]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_missing_edgar_reports_clean_error(tmp_path):
+    # [universe] present but no [edgar] — the EdgarClient gate must fail loudly
+    # (exit 2) BEFORE any EDGAR/ClickHouse access (offline, ban-safe).
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_placeholder_email_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n' + _EDGAR_PLACEHOLDER)
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_empty_universe_exits_1(tmp_path):
+    # A Universe that resolves to zero companies is a hard misconfiguration →
+    # exit 1, offline (resolution reads the bundled table; the empty check precedes
+    # any ClickHouse/EDGAR access).
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["ZZZZINVALID"]\n' + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "empty" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_nothing_to_do_exits_0(tmp_path, monkeypatch):
+    # AC-3: the one CLI-drivable happy branch offline — stub the index fetch to
+    # return no candidates, so the reused reconciler yields an empty work list and
+    # catch_up returns NOTHING_TO_DO (no companyfacts request), exit 0.
+    import fintin.adapters.edgar.filings_index as fi_mod
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 0
+    assert "Nothing to do" in result.output
+    assert "NOTHING_TO_DO" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_throttle_aborts_with_exit_1(tmp_path, monkeypatch):
+    # AC-4 / SM-C1: an EDGAR throttle propagated from the engine maps to a loud
+    # exit 1 at the CLI boundary — the ban-safety wiring, asserted offline. The
+    # index fetch is stubbed so no live request happens before the engine runs.
+    import fintin.adapters.edgar.filings_index as fi_mod
+    import fintin.core.catchup as cu_mod
+    from fintin.adapters.edgar.client import EdgarThrottleError
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    monkeypatch.setattr(
+        cu_mod, "catch_up", _raise(EdgarThrottleError("throttled after retries"))
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "throttled" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_systemic_abort_exits_1(tmp_path, monkeypatch):
+    # A BackfillAborted (too many consecutive failures — e.g. store down) maps to
+    # exit 1, not a green "complete".
+    import fintin.adapters.edgar.filings_index as fi_mod
+    import fintin.core.catchup as cu_mod
+    from fintin.core.backfill import BackfillAborted
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    # Use the engine's real command-neutral abort wording (backfill_universe is
+    # shared by both commands) so the test reflects production output, not a
+    # fabricated "catch-up aborted…"/"backfill aborted…" string.
+    monkeypatch.setattr(
+        cu_mod,
+        "catch_up",
+        _raise(
+            BackfillAborted(
+                "run aborted after 10 consecutive failures (last: CIK 320193 — "
+                "RuntimeError: store down); likely a systemic problem "
+                "(e.g. the store) rather than per-company data gaps"
+            )
+        ),
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "consecutive failures" in result.output
+    assert "backfill" not in result.output.lower()  # no wrong-command wording
+    assert "Traceback" not in result.output
+
+
+def test_catch_up_completed_renders_summary_and_gaps_exit_0(tmp_path, monkeypatch):
+    # The COMPLETED render branch needs no live EDGAR — it renders purely from a
+    # CatchUpReport. Monkeypatch the engine to RETURN a hand-built COMPLETED report
+    # (1 ingested, 1 recorded gap) and assert the GREEN summary + YELLOW gap line +
+    # --show-gaps enumeration + exit 0. (Guards the success-render f-strings that
+    # the throttle/systemic/NOTHING_TO_DO branches don't exercise.)
+    import fintin.adapters.edgar.filings_index as fi_mod
+    import fintin.core.catchup as cu_mod
+    from fintin.core.backfill import BackfillFailure, BackfillReport
+    from fintin.core.catchup import CatchUpReport, CatchUpStatus
+    from fintin.core.ingest import IngestResult
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(fi_mod, "fetch_work_candidates", lambda *a, **k: [])
+    ingested = IngestResult(
+        cik=2,
+        facts_seen=3,
+        rows_landed=3,
+        dropped_dimensional=0,
+        dropped_non_standard=0,
+        dropped_non_numeric=0,
+        dropped_incomplete=0,
+        deduped=0,
+        version=1,
+    )
+    report = CatchUpReport(
+        status=CatchUpStatus.COMPLETED,
+        scanned=4,
+        outstanding=2,
+        companies=2,
+        backfill=BackfillReport(
+            ingested=(ingested,),
+            skipped=(),
+            failures=(BackfillFailure(1, "RuntimeError: boom"),),
+            version=1,
+        ),
+    )
+    monkeypatch.setattr(cu_mod, "catch_up", lambda *a, **k: report)
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + "\n[universe]\nciks = [320193]\n" + _EDGAR_VALID)
+    result = runner.invoke(app, ["catch-up", "--config", str(p), "--show-gaps"])
+    assert result.exit_code == 0
+    assert "Catch-up complete (STARTED→COMPLETED)" in result.output
+    assert "1 company ingested" in result.output  # companies_ingested == 1 → singular
+    assert "3 facts landed" in result.output
+    assert "2 outstanding filing(s)" in result.output
+    assert "recorded as explained gaps" in result.output
+    assert "CIK 1: RuntimeError: boom" in result.output  # --show-gaps enumeration
     assert "Traceback" not in result.output
 
 
