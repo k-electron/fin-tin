@@ -27,6 +27,7 @@ from fintin.adapters.edgar.client import (
     EdgarThrottleError,
 )
 from fintin.config import ClickHouseConfig, Config, EdgarConfig
+from tests.purity import module_imports
 
 _CH = ClickHouseConfig(
     host="localhost", port=8123, username="default", password="", database="default"
@@ -266,11 +267,18 @@ def test_no_edgar_or_raw_http_imports_outside_edgar_adapter():
         "edgar", "httpx", "requests",
         "urllib", "http", "aiohttp", "urllib3", "socket", "ftplib",
     }
+    # The one non-EDGAR fetch in the tool: the S&P 500 constituent list, which the
+    # SEC does not publish (it is S&P's index), so it cannot come through the EDGAR
+    # client. Exempted by path, and the assertion below keeps the exemption from
+    # becoming a backdoor to un-rate-limited sec.gov access.
+    non_edgar_http = root / "adapters" / "constituents.py"
     offenders: list[tuple[str, str]] = []
 
     for py in root.rglob("*.py"):
         if py.parent == edgar_adapter or edgar_adapter in py.parents:
             continue  # the client IS allowed to import edgar/httpx
+        if py == non_edgar_http:
+            continue
         tree = ast.parse(py.read_text(), filename=str(py))
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
@@ -282,3 +290,30 @@ def test_no_edgar_or_raw_http_imports_outside_edgar_adapter():
                     offenders.append((str(py), node.module or ""))
 
     assert not offenders, f"EDGAR/raw-HTTP imports outside adapters/edgar: {offenders}"
+
+
+def test_non_edgar_http_adapter_never_reaches_sec_gov():
+    """The constituents adapter is exempt from the raw-HTTP ban above, so verify
+    the exemption stays honest: it must never address sec.gov (or route through
+    the edgar package), which would be an EDGAR request escaping the rate limiter
+    and the fair-access User-Agent — the ban risk AC-3 exists to prevent."""
+    path = (
+        Path(__file__).resolve().parent.parent
+        / "fintin"
+        / "adapters"
+        / "constituents.py"
+    )
+    # Assert on URL literals, not prose — the module's docstring explains at length
+    # that it must never touch sec.gov, and matching raw text would flag that.
+    tree = ast.parse(path.read_text(), filename=str(path))
+    urls = [
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and node.value.lower().startswith(("http://", "https://"))
+    ]
+    assert urls, "no URL literal found — has the fetch moved?"
+    assert not [u for u in urls if "sec.gov" in u.lower()], urls
+    # And it must not reach the edgar package (which would re-enter EDGAR's path).
+    assert "edgar" not in module_imports("fintin/adapters/constituents.py")

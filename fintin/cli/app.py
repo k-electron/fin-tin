@@ -440,6 +440,118 @@ def map_canonical_command(
     )
 
 
+def _refresh_sp500(cfg, *, config_path: Path, write: bool) -> None:
+    """Fetch S&P 500 constituents and emit a [universe] block (optionally writing it).
+
+    Split out of `universe_command` because it is a different operation that
+    happens to share the noun: it reaches the network (a non-EDGAR host) and
+    produces config, where the command's normal mode is offline and read-only."""
+    from fintin.adapters.constituents import (
+        DEFAULT_CONSTITUENTS_URL,
+        ConstituentFetchError,
+        fetch_constituents_csv,
+    )
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.core.constituents import (
+        parse_constituents_csv,
+        render_universe_block,
+        replace_universe_section,
+    )
+
+    url = (cfg.universe.constituents_url if cfg.universe else None) or (
+        DEFAULT_CONSTITUENTS_URL
+    )
+    logger.info("Fetching S&P 500 constituents from %s", url)
+    try:
+        csv_text = fetch_constituents_csv(url)
+        parsed = parse_constituents_csv(csv_text)
+    except ConstituentFetchError as exc:
+        typer.secho(f"Constituent fetch failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except ValueError as exc:  # unparseable / wrong-shape CSV
+        typer.secho(f"Constituent parse failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    if not parsed.constituents:
+        typer.secho(
+            f"Constituent source at {url} yielded no companies.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    tickers = parsed.tickers
+    # Which of these does edgartools resolve offline? Any that don't would become
+    # explained gaps at backfill time — but the source usually supplies a CIK, so
+    # carry those into [universe].ciks and the Universe stays complete.
+    try:
+        resolved = resolve_tickers(list(tickers))
+    except Exception as exc:
+        raise _fail_unexpected("Ticker resolution failed", exc)
+
+    unresolved = [t for t in tickers if resolved.get(t) is None]
+    rescued = tuple(
+        sorted(
+            c.cik
+            for c in parsed.with_cik
+            if c.cik is not None and c.ticker in set(unresolved)
+        )
+    )
+    still_missing = [
+        t
+        for t in unresolved
+        if not any(c.ticker == t and c.cik is not None for c in parsed.constituents)
+    ]
+
+    block = render_universe_block(tickers, rescued)
+    if cfg.universe is not None and cfg.universe.constituents_url:
+        block += f'\nconstituents_url = "{cfg.universe.constituents_url}"'
+
+    typer.secho(
+        f"Fetched {len(tickers)} constituents from {url}: "
+        f"{len(tickers) - len(unresolved)} resolve offline, "
+        f"{len(rescued)} carried as explicit CIKs, {len(still_missing)} unresolvable.",
+        fg=typer.colors.GREEN,
+    )
+    for note in parsed.skipped:
+        typer.secho(f"  skipped: {note}", fg=typer.colors.YELLOW)
+    if still_missing:
+        typer.secho(
+            "  no CIK available for: " + ", ".join(still_missing),
+            fg=typer.colors.YELLOW,
+        )
+
+    if not write:
+        typer.secho(
+            f"\n# Paste into {config_path} (or re-run with --write):",
+            fg=typer.colors.BLUE,
+        )
+        typer.echo(block)
+        return
+
+    original = config_path.read_text()
+    try:
+        updated = replace_universe_section(original, block)
+    except ValueError:
+        updated = original.rstrip("\n") + "\n\n" + block + "\n"
+        typer.secho(
+            f"No [universe] section in {config_path} — appended one.",
+            fg=typer.colors.YELLOW,
+        )
+    backup = config_path.with_suffix(config_path.suffix + ".bak")
+    backup.write_text(original)
+    config_path.write_text(updated)
+    typer.secho(
+        f"Wrote [universe] to {config_path} ({len(tickers)} tickers, "
+        f"{len(rescued)} CIKs). Previous version saved to {backup}.",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        "Note: comments inside the [universe] section were replaced.",
+        fg=typer.colors.YELLOW,
+    )
+
+
 @app.command("universe")
 def universe_command(
     config: Path = typer.Option(
@@ -453,18 +565,41 @@ def universe_command(
         "--show-ciks",
         help="Also print the full sorted list of resolved CIKs.",
     ),
+    refresh_sp500: bool = typer.Option(
+        False,
+        "--refresh-sp500",
+        help="Fetch the current S&P 500 constituents and print a [universe] block.",
+    ),
+    write: bool = typer.Option(
+        False,
+        "--write",
+        help="With --refresh-sp500: rewrite the [universe] section in the config (backs it up first).",
+    ),
 ) -> None:
     """Resolve the configured [universe] to CIKs and report scope + explained gaps.
 
     Offline: tickers resolve via edgartools' bundled reference table (no EDGAR
     request, no contact email needed). Unresolvable tickers are reported as
-    explained gaps, never silently dropped."""
+    explained gaps, never silently dropped.
+
+    --refresh-sp500 instead fetches the current S&P 500 constituent list (one
+    non-EDGAR HTTP GET) and emits a ready-to-use [universe] block."""
     _configure_logging()
+    if write and not refresh_sp500:
+        typer.secho(
+            "--write only applies with --refresh-sp500.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+
     try:
         cfg = load_config(config)
     except ConfigError as exc:
         typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
+
+    if refresh_sp500:
+        _refresh_sp500(cfg, config_path=config, write=write)
+        return
 
     if cfg.universe is None:
         typer.secho(

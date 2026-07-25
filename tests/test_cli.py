@@ -1049,6 +1049,111 @@ def test_status_fully_covered_has_no_gap_line(tmp_path, status_db, local_clickho
     assert "Traceback" not in res.output
 
 
+# --- universe --refresh-sp500 (fetch is faked; no network in the suite) ---------
+
+_SP500_CSV = (
+    "Symbol,Security,GICS Sector,CIK\n"
+    "AAPL,Apple Inc.,Information Technology,320193\n"
+    "ZZZZ,Unresolvable Corp,Industrials,1234567\n"
+)
+
+
+def _sp500_env(tmp_path, monkeypatch, csv_text=_SP500_CSV):
+    """Config + a faked constituent fetch + a resolver that knows only AAPL."""
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["OLD"]\n')
+    import fintin.adapters.constituents as fetch_mod
+    import fintin.adapters.edgar.universe as uni_mod
+
+    monkeypatch.setattr(fetch_mod, "fetch_constituents_csv", lambda url: csv_text)
+    monkeypatch.setattr(
+        uni_mod, "resolve_tickers", lambda ts: {t: (320193 if t == "AAPL" else None) for t in ts}
+    )
+    return p
+
+
+def test_refresh_sp500_prints_a_block_without_touching_the_config(tmp_path, monkeypatch):
+    p = _sp500_env(tmp_path, monkeypatch)
+    before = p.read_text()
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert result.exit_code == 0
+    assert "[universe]" in result.output and "AAPL" in result.output
+    assert p.read_text() == before, "printed run must not modify the config"
+
+
+def test_refresh_sp500_carries_unresolvable_tickers_as_explicit_ciks(tmp_path, monkeypatch):
+    """The completeness backstop: ZZZZ doesn't resolve offline, but the source
+    gave a CIK, so it lands in [universe].ciks instead of becoming a gap."""
+    p = _sp500_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert "1 carried as explicit CIKs" in result.output
+    assert "1234567" in result.output
+
+
+def test_refresh_sp500_write_updates_config_and_backs_it_up(tmp_path, monkeypatch):
+    import tomllib
+
+    p = _sp500_env(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app, ["universe", "--config", str(p), "--refresh-sp500", "--write"]
+    )
+    assert result.exit_code == 0
+    loaded = tomllib.loads(p.read_text())
+    assert loaded["universe"]["tickers"] == ["AAPL", "ZZZZ"]
+    assert loaded["universe"]["ciks"] == [1234567]
+    assert loaded["clickhouse"]["host"] == "localhost"  # other sections survive
+    backup = tmp_path / "fintin.toml.bak"
+    assert backup.exists() and 'tickers = ["OLD"]' in backup.read_text()
+
+
+def test_refresh_sp500_write_is_recoverable_from_the_backup(tmp_path, monkeypatch):
+    """The backup is the safety net for the section-replacement being string
+    surgery — it must actually restore the original byte-for-byte."""
+    p = _sp500_env(tmp_path, monkeypatch)
+    original = p.read_text()
+    runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500", "--write"])
+    assert (tmp_path / "fintin.toml.bak").read_text() == original
+
+
+def test_refresh_sp500_reports_a_reshaped_source_instead_of_wiping_the_universe(
+    tmp_path, monkeypatch
+):
+    """A source that lost its Symbol column must fail loudly — writing an empty
+    Universe would silently destroy the user's scope."""
+    p = _sp500_env(tmp_path, monkeypatch, csv_text="Name,Sector\nApple,Tech\n")
+    before = p.read_text()
+    result = runner.invoke(
+        app, ["universe", "--config", str(p), "--refresh-sp500", "--write"]
+    )
+    assert result.exit_code == 1
+    assert "Constituent parse failed" in result.output
+    assert p.read_text() == before  # untouched
+    assert "Traceback" not in result.output
+
+
+def test_refresh_sp500_reports_a_fetch_failure_cleanly(tmp_path, monkeypatch):
+    import fintin.adapters.constituents as fetch_mod
+
+    p = _sp500_env(tmp_path, monkeypatch)
+
+    def _boom(url):
+        raise fetch_mod.ConstituentFetchError("HTTP 503")
+
+    monkeypatch.setattr(fetch_mod, "fetch_constituents_csv", _boom)
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert result.exit_code == 1
+    assert "Constituent fetch failed" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_write_without_refresh_is_rejected(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    result = runner.invoke(app, ["universe", "--config", str(p), "--write"])
+    assert result.exit_code == 2
+    assert "--write only applies" in result.output
+
+
 # --- reset (destructive; the --yes guard is the safety-critical part) -----------
 
 
