@@ -722,6 +722,15 @@ def status_command(
         typer.secho(f"Universe resolution failed: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=1)
     if not resolved.ciks:
+        # Surface WHICH tickers failed before the empty-Universe error (SM-2 — this
+        # is exactly the branch where the explained gaps are most useful), mirroring
+        # the `universe` command rather than dropping them.
+        if resolved.gaps:
+            typer.secho(
+                f"{len(resolved.gaps)} unresolvable ticker(s):", fg=typer.colors.YELLOW
+            )
+            for gap in resolved.gaps:
+                typer.secho(f"  - {gap.identifier}: {gap.reason}", fg=typer.colors.YELLOW)
         typer.secho(
             "Resolved Universe is empty — check the [universe] tickers/ciks.",
             fg=typer.colors.RED,
@@ -752,10 +761,13 @@ def status_command(
 
     noun = "company" if report.in_scope == 1 else "companies"
     hwm_str = report.hwm.isoformat() if report.hwm is not None else "none (store empty)"
+    # GREEN only when fully covered; YELLOW when there are gaps, so the primary
+    # line's colour is an honest at-a-glance signal (not a green "all good").
+    summary_color = typer.colors.GREEN if report.is_complete else typer.colors.YELLOW
     typer.secho(
         f"Coverage: {report.present} of {report.in_scope} in-scope {noun} present. "
         f"High-water mark: {hwm_str}.",
-        fg=typer.colors.GREEN,
+        fg=summary_color,
     )
     # Explained gaps are a known state, not an error — the report still exits 0
     # (gaps are surfaced, never silently omitted; SM-2).

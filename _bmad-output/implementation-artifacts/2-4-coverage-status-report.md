@@ -4,7 +4,7 @@ baseline_commit: 5453e481280c6f73359458507e8a924fea492340
 
 # Story 2.4: Coverage & status report
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -125,6 +125,15 @@ report   = compute_coverage(resolved, present, hwm)            # pure: in-scope 
 - [Source: _bmad-output/implementation-artifacts/2-3-per-company-resumable-backfill.md — the hand-off ("Story 2.4's `fintin status` reconstructs zero-fact gaps directly from the DB"), `present_ciks`/`high_water_mark`, P1 traceback-guard + P5 resolved.gaps review lessons]
 - [Source: _bmad-output/implementation-artifacts/deferred-work.md — line ratifying "the Story 2.4 coverage surface … derives zero-fact gaps from DB absence"]
 
+## Review Findings
+
+Reviewed 2026-07-24 by 3 parallel adversarial layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor), all completed. **All 5 ACs and all 7 settled decisions verified genuinely satisfied; no Critical/High.** Independently confirmed: the offline invariant (no `EdgarClient`/email), `core/coverage.py` purity, parameterized queries, `finally`-close, no DDL/config change, and the 2.3 review lessons (wrapped `resolve_universe`, surfaced `resolved.gaps`). Triage: **3 patch, 1 defer, 4 dismissed.** All three layers flagged the empty-universe gap-drop (P1).
+
+- [x] [Review][Patch] **Empty-Universe exit drops the resolution gaps** — when every configured entry is an unresolvable ticker (`ciks=()` but `gaps` populated), the `if not resolved.ciks:` guard exits 1 with the generic "empty" message *before* rendering `resolved.gaps`, so the user is never told *which* ticker failed — even with `--show-gaps`. The sibling `universe` renders gaps *before* its empty guard. Surface `resolved.gaps` before the empty-Universe exit (SM-2 — no silent omissions on the branch where gaps matter most). [fintin/cli/app.py]
+- [x] [Review][Patch] **Coverage summary is GREEN even when coverage is badly incomplete** — "1 of 500 present" prints in success-green, reading "all good" at a glance (the YELLOW gap line follows, but the primary line misleads). Color the summary by completeness — GREEN when `report.is_complete`, YELLOW when there are gaps — an honest at-a-glance signal (and it puts the currently-unused `is_complete` property to work). [fintin/cli/app.py]
+- [x] [Review][Patch] **Add the missing CLI-render tests (AC-5)** — the CLI happy-path uses only `ciks`, so the resolution-gap render branch, the default (no-`--show-gaps`) gating, the `"none (store empty)"` HWM literal, the fully-covered (no-YELLOW-line) path, and the `StoreConnectionError`→exit-1 path are all unexercised at the command boundary. Add: an offline connection-failure→exit-1 test; an integration test with both gap classes asserting default-counts-only vs `--show-gaps` enumeration; an empty-store test asserting `"none (store empty)"` + exit 0; a fully-covered test asserting the GREEN summary with no gap line. [tests/test_cli.py]
+- [x] [Review][Defer] **High-water mark is store-wide, not Universe-scoped** [fintin/cli/app.py] — "0 in-scope present" can still print a real HWM from out-of-scope data. FR-14 explicitly specifies "the store's High-water mark" (so store-wide is spec-compliant), a scoped HWM would need a new repo query the story deliberately avoided, and the mismatch arises only under Universe-config churn. Deferred, logged (annotate or scope later).
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -159,3 +168,4 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 
 - 2026-07-24 — Story 2.4 drafted via create-story (2 parallel research agents: architecture/AC crux + code inventory). Design settled: offline read-only `fintin status`; pure `compute_coverage` in `core/coverage.py`; composes `resolve_universe` + `present_ciks` + `high_water_mark`; explained gaps = unresolvable tickers + zero-fact companies (derived, AD-1 — a failed-backfill company = DB absence, reason "no facts in store"); no EdgarClient/email (AC-3); no DDL/config. Status → ready-for-dev.
 - 2026-07-24 — Story 2.4 implemented (red-green-refactor through all 4 tasks). Pure `compute_coverage` engine + `CoverageReport` (`core/coverage.py`); offline `fintin status` dumb trigger (`--show-gaps`). Composes `resolve_universe` (offline) + `present_ciks` + `high_water_mark`; derives coverage by set difference (AD-1 — no failures table). Two gap classes surfaced (SM-2). No `EdgarClient`/email (AC-3), no DDL/config change (AD-18). **258 tests pass (+13)**; AST guard confirms `core/coverage.py` is `edgar`/ClickHouse/`pyarrow`-free; the offline happy path is end-to-end integration-tested (NFR-7: zero live-EDGAR). Live smoke confirmed the derived zero-fact gap + HWM with no email. Status → review.
+- 2026-07-24 — Code review (3 parallel adversarial layers). All 5 ACs + 7 decisions verified satisfied; no Critical/High. Applied all **3 patch findings**: (P1) surface `resolved.gaps` before the empty-Universe exit so a typo'd ticker is named, not silently dropped (SM-2, mirrors `universe`); (P2) colour the coverage summary by `is_complete` (GREEN when covered / YELLOW when gaps) for an honest at-a-glance signal; (P3) added the missing CLI-render tests — offline connection-failure→exit-1, integration both-gap-classes with default-vs-`--show-gaps`, empty-store `"none (store empty)"`, fully-covered no-gap-line. **1 deferred** (store-wide HWM — FR-14 says "the store's HWM"; scoping needs a new query) and **4 dismissed** (opaque absent-schema message, unbounded `--show-gaps`, unwrapped deferred imports, integration-gating), logged. **262 tests pass (+4)**; live smoke re-verified both gap classes render. Secret-scan clean. Status → done.
