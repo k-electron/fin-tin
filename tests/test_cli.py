@@ -622,6 +622,115 @@ def test_backfill_already_running_coalesces_exit_0(tmp_path, monkeypatch):
         holder.release()
 
 
+# --- recover (Story 3.3) -------------------------------------------------------
+# Scoped re-ingest of one company. The happy path hits EDGAR (companyfacts), so
+# it's covered offline by test_recover; here we assert the error + ban-safety
+# wiring only (NFR-7 — no live EDGAR). No [universe] needed (recover targets a CIK).
+
+
+def test_help_lists_recover():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "recover" in result.output
+
+
+def test_recover_invalid_cik_exits_2():
+    # CIK validation precedes config load — a bad CIK fails fast (exit 2), offline.
+    for bad in ("0", "5000000000"):  # below 1 and above 2**32-1
+        result = runner.invoke(app, ["recover", bad])
+        assert result.exit_code == 2
+        assert "Invalid CIK" in result.output
+        assert "Traceback" not in result.output
+
+
+def test_recover_missing_config_exits_2():
+    result = runner.invoke(app, ["recover", "320193", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_recover_missing_edgar_exits_2(tmp_path):
+    # No [edgar] — the EdgarClient gate must fail loudly (exit 2) before any EDGAR
+    # or ClickHouse access (offline, ban-safe). No [universe] required.
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)
+    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_recover_placeholder_email_exits_2(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + _EDGAR_PLACEHOLDER)
+    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_recover_no_company_facts_exits_1(tmp_path, monkeypatch):
+    # EDGAR has no companyfacts for the CIK → a clean exit 1 (like ingest-company).
+    import fintin.core.recover as rec_mod
+    from fintin.adapters.edgar.facts import NoCompanyFactsError
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        rec_mod,
+        "recover_company",
+        _raise(NoCompanyFactsError("no companyfacts for CIK 320193")),
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + _EDGAR_VALID)
+    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "companyfacts" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_recover_throttle_exits_1(tmp_path, monkeypatch):
+    import fintin.core.recover as rec_mod
+    from fintin.adapters.edgar.client import EdgarThrottleError
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        rec_mod, "recover_company", _raise(EdgarThrottleError("throttled after retries"))
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + _EDGAR_VALID)
+    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    assert result.exit_code == 1
+    assert "throttled" in result.output.lower()
+    assert "Traceback" not in result.output
+
+
+def test_recover_already_running_coalesces_exit_0(tmp_path, monkeypatch):
+    # Recover shares the single-flight lease — a live run holding it → ALREADY_RUNNING
+    # (exit 0) with NO EDGAR request (recover_company is never reached).
+    import fintin.core.recover as rec_mod
+    from fintin.adapters.lease.file_lease import FileLease
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        rec_mod,
+        "recover_company",
+        _boom_if_called("recover_company must not run while coalesced"),
+    )
+    lease_path = str(tmp_path / "test.lease")
+    holder = FileLease(lease_path, ttl_seconds=120, heartbeat_seconds=15)
+    assert holder.acquire() is True
+    try:
+        p = tmp_path / "fintin.toml"
+        p.write_text(_CH_ONLY + _EDGAR_VALID + f'\n[lease]\npath = "{lease_path}"\n')
+        result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+        assert result.exit_code == 0
+        assert "ALREADY_RUNNING" in result.output
+        assert "Traceback" not in result.output
+    finally:
+        holder.release()
+
+
 # --- status (Story 2.4) --------------------------------------------------------
 # Offline command (ClickHouse + bundled-parquet resolution only, NO EdgarClient).
 # Error paths are pure-offline; the happy path is integration-tested end to end

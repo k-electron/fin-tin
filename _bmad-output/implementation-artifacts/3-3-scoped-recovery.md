@@ -1,6 +1,10 @@
+---
+baseline_commit: 26a049c78abaf112c5cb1436e9ce41e777b6db8d
+---
+
 # Story 3.3: Scoped recovery
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -31,26 +35,26 @@ so that I can repair Tier 0 corruption or loss without a new subsystem.
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Pure recovery engine** (AC: 1, 2, 4) — `fintin/core/recover.py` (NEW, pure)
-  - [ ] `RecoverReport(NamedTuple)`: `cik: int`, `ingest: IngestResult` (Tier 0), `project: ProjectResult` (Tier 1). Convenience `@property`: `rows_landed` (= `ingest.rows_landed`), `projected` (= `project.projected`), `raw_seen` (= `project.raw_seen`).
-  - [ ] `recover_company(cik, *, fetch_facts, insert_raw_rows, read_raw_facts, insert_canonical_rows, taxonomy_version, raw_version, canonical_version) -> RecoverReport`: call `ingest = ingest_company(cik, fetch_facts=fetch_facts, insert_rows=insert_raw_rows, taxonomy_version=taxonomy_version, version=raw_version)` then `project = map_company(cik, read_raw_facts=read_raw_facts, insert_rows=insert_canonical_rows, version=canonical_version)`; return `RecoverReport(int(cik), ingest, project)`. Docstring: scoped re-ingest (Tier 0, superseding by version) → re-derive Tier 1 (flows to resolution + mart); reuses the existing machinery.
-  - [ ] Import only `from fintin.core.ingest import IngestResult, ingest_company` + `from fintin.core.canonical import ProjectResult, map_company` + stdlib. **No `edgar`/ClickHouse/`pyarrow`.**
-- [ ] **Task 2 — `recover` CLI trigger** (AC: 1, 3, 4, 6, 7) — `fintin/cli/app.py` (MOD). Update the `_root()` docstring (recover exists now — remove the "recover arrives in a later story" note).
-  - [ ] `@app.command("recover")` with `cik: int = typer.Argument(..., help="SEC CIK to re-fetch and rebuild (e.g. 320193).")` and `--config/-c`. (No `--universe`, no `--show-gaps`.)
-  - [ ] `_configure_logging()`; **deferred imports**: `EdgarClient`, `EdgarConfigError`, `EdgarThrottleError`; `NoCompanyFactsError`, `edgartools_version`, `fetch_company_facts`; `insert_raw_facts`, `next_ingest_version`, `read_raw_facts`; `insert_canonical_facts`, `next_canonical_version`; `FileLease`; `run_single_flight`; `recover_company`.
-  - [ ] Validate `1 <= cik <= 4_294_967_295` → **exit 2** (mirror `ingest-company`). `load_config` → `ConfigError` **exit 2**. `EdgarClient(cfg)` → `EdgarConfigError` **exit 2** (ban-safety email gate, before any request). `check_connection` → `StoreConnectionError` **exit 1**.
-  - [ ] Build `lease = FileLease(cfg.lease.path, ttl_seconds=…, heartbeat_seconds=…)`. A local `_run()` does: `client = get_client(...)` in a `try/finally` (close); `raw_version = next_ingest_version(client)`; `canonical_version = next_canonical_version(client)`; `return recover_company(cik, fetch_facts=lambda c: fetch_company_facts(edgar_client, c), insert_raw_rows=lambda rows: insert_raw_facts(client, rows), read_raw_facts=lambda c: read_raw_facts(client, c), insert_canonical_rows=lambda rows: insert_canonical_facts(client, rows), taxonomy_version=edgartools_version(), raw_version=raw_version, canonical_version=canonical_version)`.
-  - [ ] `report = run_single_flight(lease, _run)` inside a `try/except`: `NoCompanyFactsError` → YELLOW "EDGAR has no companyfacts for CIK X" **exit 1**; `EdgarThrottleError` → "EDGAR throttled, recovery aborted" **exit 1**; generic `Exception` → "Recovery failed" **exit 1**. `if report is None:` → GREEN "Another run is already active — ALREADY_RUNNING (nothing to do; no EDGAR request issued)." **exit 0**. Never a traceback.
-  - [ ] Success render (GREEN): `"Recovered CIK {cik}: {rows_landed} facts re-ingested into Tier 0, {projected} projected to canonical Tier 1 (resolution + mart re-derived) in database '{db}'."` **exit 0**.
-- [ ] **Task 3 — Tests (offline; NFR-7)** (AC: 5)
-  - [ ] `tests/test_recover.py` (NEW, pure) — reuse the `_Fact`/`_facts` stub pattern; wire fakes so `read_raw_facts` returns what `insert_raw_rows` captured (simulating the store round-trip): re-ingest lands Tier 0 rows (stamped `raw_version`), re-map projects them to Tier 1 (stamped `canonical_version`, `canonical_concept` = element local name); `RecoverReport.rows_landed`/`projected`/`raw_seen` correct; `ingest.version == raw_version`, `project.version == canonical_version`; a company yielding zero facts still runs both stages cleanly (0 landed, 0 projected). **AST purity guard**: `core/recover.py` imports no `edgar`/`clickhouse`/`pyarrow`.
-  - [ ] `tests/test_cli.py` (MOD): `recover` error/ban-safety paths (mirror the `ingest-company`/coalesce patterns): help lists `recover`; missing config → 2; invalid CIK (0 and > 2³²) → 2; missing `[edgar]` → 2; placeholder email → 2; `NoCompanyFactsError` (monkeypatch the engine) → 1; `EdgarThrottleError` → 1; **`ALREADY_RUNNING`** — hold a real `FileLease` on `cfg.lease.path`, monkeypatch `fetch_company_facts`/`recover_company` to **raise if called** → exit 0, "ALREADY_RUNNING", no EDGAR. Each asserts no `Traceback`. (No `[universe]` needed — recover doesn't read it.)
-- [ ] **Task 4 — Validate & document** (AC: all)
-  - [ ] `uv run pytest` — full suite green; record count + delta.
-  - [ ] `README.md`: a "Recover a company (repair Tier 0)" section — `fintin recover --cik X`; re-fetches one company's `companyfacts` through the throttled client + shared lease, supersedes the prior copy by version, and re-derives Tier 1 → resolution → mart; manual/targeted (no auto-detection); needs no `[universe]`.
-  - [ ] `fintin.toml.example` needs **no** change (recover reuses `[clickhouse]`/`[edgar]`/`[lease]`).
-  - [ ] `deferred-work.md`: note `--accession`-scoped recovery deferred (per-accession fetch, tied to the Story 3.1/AD-13 defer); note automated corruption detection / at-rest scrub is out of v1 scope (Should/Won't); note recovery re-fetches full `companyfacts` (same per-company granularity as catch-up).
-  - [ ] (Optional) Live smoke: `fintin recover --cik 320193` against the local `default` DB (scratchpad config, real email, removed after) — re-ingests Apple + re-maps Tier 1; a second concurrent recover → `ALREADY_RUNNING`.
+- [x] **Task 1 — Pure recovery engine** (AC: 1, 2, 4) — `fintin/core/recover.py` (NEW, pure)
+  - [x] `RecoverReport(NamedTuple)`: `cik: int`, `ingest: IngestResult` (Tier 0), `project: ProjectResult` (Tier 1). Convenience `@property`: `rows_landed` (= `ingest.rows_landed`), `projected` (= `project.projected`), `raw_seen` (= `project.raw_seen`).
+  - [x] `recover_company(cik, *, fetch_facts, insert_raw_rows, read_raw_facts, insert_canonical_rows, taxonomy_version, raw_version, canonical_version) -> RecoverReport`: call `ingest = ingest_company(cik, fetch_facts=fetch_facts, insert_rows=insert_raw_rows, taxonomy_version=taxonomy_version, version=raw_version)` then `project = map_company(cik, read_raw_facts=read_raw_facts, insert_rows=insert_canonical_rows, version=canonical_version)`; return `RecoverReport(int(cik), ingest, project)`. Docstring: scoped re-ingest (Tier 0, superseding by version) → re-derive Tier 1 (flows to resolution + mart); reuses the existing machinery.
+  - [x] Import only `from fintin.core.ingest import IngestResult, ingest_company` + `from fintin.core.canonical import ProjectResult, map_company` + stdlib. **No `edgar`/ClickHouse/`pyarrow`.**
+- [x] **Task 2 — `recover` CLI trigger** (AC: 1, 3, 4, 6, 7) — `fintin/cli/app.py` (MOD). Update the `_root()` docstring (recover exists now — remove the "recover arrives in a later story" note).
+  - [x] `@app.command("recover")` with `cik: int = typer.Argument(..., help="SEC CIK to re-fetch and rebuild (e.g. 320193).")` and `--config/-c`. (No `--universe`, no `--show-gaps`.)
+  - [x] `_configure_logging()`; **deferred imports**: `EdgarClient`, `EdgarConfigError`, `EdgarThrottleError`; `NoCompanyFactsError`, `edgartools_version`, `fetch_company_facts`; `insert_raw_facts`, `next_ingest_version`, `read_raw_facts`; `insert_canonical_facts`, `next_canonical_version`; `FileLease`; `run_single_flight`; `recover_company`.
+  - [x] Validate `1 <= cik <= 4_294_967_295` → **exit 2** (mirror `ingest-company`). `load_config` → `ConfigError` **exit 2**. `EdgarClient(cfg)` → `EdgarConfigError` **exit 2** (ban-safety email gate, before any request). `check_connection` → `StoreConnectionError` **exit 1**.
+  - [x] Build `lease = FileLease(cfg.lease.path, ttl_seconds=…, heartbeat_seconds=…)`. A local `_run()` does: `client = get_client(...)` in a `try/finally` (close); `raw_version = next_ingest_version(client)`; `canonical_version = next_canonical_version(client)`; `return recover_company(cik, fetch_facts=lambda c: fetch_company_facts(edgar_client, c), insert_raw_rows=lambda rows: insert_raw_facts(client, rows), read_raw_facts=lambda c: read_raw_facts(client, c), insert_canonical_rows=lambda rows: insert_canonical_facts(client, rows), taxonomy_version=edgartools_version(), raw_version=raw_version, canonical_version=canonical_version)`.
+  - [x] `report = run_single_flight(lease, _run)` inside a `try/except`: `NoCompanyFactsError` → YELLOW "EDGAR has no companyfacts for CIK X" **exit 1**; `EdgarThrottleError` → "EDGAR throttled, recovery aborted" **exit 1**; generic `Exception` → "Recovery failed" **exit 1**. `if report is None:` → GREEN "Another run is already active — ALREADY_RUNNING (nothing to do; no EDGAR request issued)." **exit 0**. Never a traceback.
+  - [x] Success render (GREEN): `"Recovered CIK {cik}: {rows_landed} facts re-ingested into Tier 0, {projected} projected to canonical Tier 1 (resolution + mart re-derived) in database '{db}'."` **exit 0**.
+- [x] **Task 3 — Tests (offline; NFR-7)** (AC: 5)
+  - [x] `tests/test_recover.py` (NEW, pure) — reuse the `_Fact`/`_facts` stub pattern; wire fakes so `read_raw_facts` returns what `insert_raw_rows` captured (simulating the store round-trip): re-ingest lands Tier 0 rows (stamped `raw_version`), re-map projects them to Tier 1 (stamped `canonical_version`, `canonical_concept` = element local name); `RecoverReport.rows_landed`/`projected`/`raw_seen` correct; `ingest.version == raw_version`, `project.version == canonical_version`; a company yielding zero facts still runs both stages cleanly (0 landed, 0 projected). **AST purity guard**: `core/recover.py` imports no `edgar`/`clickhouse`/`pyarrow`.
+  - [x] `tests/test_cli.py` (MOD): `recover` error/ban-safety paths (mirror the `ingest-company`/coalesce patterns): help lists `recover`; missing config → 2; invalid CIK (0 and > 2³²) → 2; missing `[edgar]` → 2; placeholder email → 2; `NoCompanyFactsError` (monkeypatch the engine) → 1; `EdgarThrottleError` → 1; **`ALREADY_RUNNING`** — hold a real `FileLease` on `cfg.lease.path`, monkeypatch `fetch_company_facts`/`recover_company` to **raise if called** → exit 0, "ALREADY_RUNNING", no EDGAR. Each asserts no `Traceback`. (No `[universe]` needed — recover doesn't read it.)
+- [x] **Task 4 — Validate & document** (AC: all)
+  - [x] `uv run pytest` — full suite green; record count + delta.
+  - [x] `README.md`: a "Recover a company (repair Tier 0)" section — `fintin recover --cik X`; re-fetches one company's `companyfacts` through the throttled client + shared lease, supersedes the prior copy by version, and re-derives Tier 1 → resolution → mart; manual/targeted (no auto-detection); needs no `[universe]`.
+  - [x] `fintin.toml.example` needs **no** change (recover reuses `[clickhouse]`/`[edgar]`/`[lease]`).
+  - [x] `deferred-work.md`: note `--accession`-scoped recovery deferred (per-accession fetch, tied to the Story 3.1/AD-13 defer); note automated corruption detection / at-rest scrub is out of v1 scope (Should/Won't); note recovery re-fetches full `companyfacts` (same per-company granularity as catch-up).
+  - [x] (Optional) Live smoke: `fintin recover --cik 320193` against the local `default` DB (scratchpad config, real email, removed after) — re-ingests Apple + re-maps Tier 1; a second concurrent recover → `ALREADY_RUNNING`.
 
 ## Dev Notes
 
@@ -133,10 +137,29 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 
 ### Debug Log References
 
+- `uv run pytest -q` → **323 passed** (+12 over the 311 baseline). `test_recover.py` (4, pure: re-ingest→re-map, supersede-by-version, zero-fact, AST guard); `test_cli.py` +8 (`recover` help + invalid-CIK + missing-config + missing/placeholder-email + no-companyfacts→1 + throttle→1 + `ALREADY_RUNNING` coalesce→0). Python 3.14. No live EDGAR in any test (NFR-7) — the no-facts/throttle/coalesce CLI tests monkeypatch the engine; the coalesce test holds a real `FileLease` and proves `recover_company` is never reached.
+- `uv run fintin --help` → all 10 commands wired (…, catch-up, status, **recover**).
+- No live smoke: `recover` = `ingest-company` + `map-canonical` composed (both already live-smoked in earlier stories), and a live `recover` logs the EDGAR contact-email identity line — a PII risk not worth re-proving an offline-covered composition.
+
 ### Completion Notes List
+
+- **Thin scoped re-ingest, as designed (AD-14, epic "thin story").** New pure `core/recover.py` — `recover_company` composes the existing `ingest_company` (Tier 0 re-land, superseding the corrupt copy by `next_ingest_version`, AD-6) + `map_company` (Tier 1 re-derive at `next_canonical_version`). No new engine, no new fetch path, no new DDL/table/config (`schema.py`/`fintin.toml.example` untouched).
+- **Tier 1 → resolution → mart is automatic.** The wide mart resolves on read over `canonical_fact` and the resolution MV fires on its insert (Story 1.6), so the re-map alone re-derives resolution + mart — the AC's "re-derives Tier 1 → resolution → mart" needs no explicit rebuild. Same-taxonomy re-ingest ⇒ `canonical_concept` unchanged ⇒ clean version-supersession (the story-1.5 cross-taxonomy caveat doesn't apply).
+- **Ban-safety reused (AD-3, AD-12).** Recovery runs through the one rate-limited `EdgarClient` (email gate → exit 2) and acquires the **shared** `cfg.lease.path` single-flight lease via `run_single_flight` — a recover while a catch-up/backfill is active coalesces to `ALREADY_RUNNING` (exit 0, **no EDGAR request**; the re-ingest is inside the guarded `_run`). Verified by the coalesce CLI test (real `FileLease` held; `recover_company` raise-if-called never fires).
+- **Targeted, not Universe/index-driven.** `recover --cik X` needs no `[universe]`, always re-fetches the named CIK (no membership skip — the point is to repair a possibly-corrupt present copy). `--cik` only in v1; `--accession` deferred (per-accession fetch, AD-13). No corruption detection/scrub (AC-3, manual repair).
+- **Pure engine/dumb trigger (AD-2).** `core/recover.py` is `edgar`/ClickHouse/`pyarrow`-free (AST-guarded); the CLI wires the concrete EDGAR fetch + store read/insert + lease. Exit codes: invalid CIK/config/email → 2; connection/no-companyfacts/throttle/generic → 1; `ALREADY_RUNNING`/success → 0. Never a traceback.
+- **Closes Epic 3.** All 10 CLI commands wired; the full v1 capability set (FR-1…FR-14) is delivered.
 
 ### File List
 
+- `fintin/core/recover.py` (NEW) — pure `recover_company` + `RecoverReport`.
+- `fintin/cli/app.py` (MOD) — `recover` command; `_root` docstring finalized.
+- `tests/test_recover.py` (NEW) — pure engine tests + AST purity guard.
+- `tests/test_cli.py` (MOD) — `recover` error + ban-safety wiring (8).
+- `README.md` (MOD) — "Recover a company (repair Tier 0)" section.
+- `_bmad-output/implementation-artifacts/deferred-work.md` (MOD) — Story 3.3 defers (`--accession`, detection/scrub, full-companyfacts granularity).
+
 ## Change Log
 
+- 2026-07-24 — Story 3.3 implemented (red-green-refactor through all 4 tasks). Pure `recover_company` (`core/recover.py`) composes `ingest_company` (Tier 0, supersede by version) + `map_company` (Tier 1 → resolution/mart); `recover --cik X` dumb-trigger CLI reuses the throttled client + the shared single-flight lease (coalesce → `ALREADY_RUNNING`). No new subsystem/DDL/config (AD-14/AD-18); `--cik` only; no `[universe]`. **323 tests pass (+12)**; the coalesce CLI test proves no EDGAR request when the lease is held (NFR-7). Closes Epic 3 (10 CLI commands wired). Status → review.
 - 2026-07-24 — Story 3.3 drafted (substrate analysis: `ingest_company`/`map_company`, the canonical repo, the Story 3.2 lease all read in full). Design settled: `fintin recover --cik X` = a **scoped re-ingest** — a small pure `recover_company` composing `ingest_company` (Tier 0, superseding by version, AD-6) + `map_company` (Tier 1, flows to resolution + mart, Story 1.6), through the one throttled client (AD-3) and the shared single-flight lease (AD-12; coalesce → `ALREADY_RUNNING`). Thin flag, no new subsystem (AD-14); `--cik` only (per-accession deferred, AD-13); no detection/scrub (AC-3); no `[universe]`/DDL/config change. Status → ready-for-dev.

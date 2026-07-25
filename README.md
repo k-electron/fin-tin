@@ -266,6 +266,29 @@ only, so it needs **no contact email** and makes no EDGAR request. Gaps don't
 change the exit code (they're a known, reported state); only a bad config or an
 unreachable store fails loudly.
 
+### Recover a company (repair Tier 0)
+
+If one company's raw facts get corrupted or lost, `fintin recover --cik X` re-fetches
+and rebuilds just that company from EDGAR:
+
+```bash
+uv run fintin recover --cik 320193   # re-ingest CIK 320193 and rebuild Tier 0 → Tier 1 → mart
+```
+
+It's a **scoped re-ingest**, not a new subsystem: it re-lands the company's full
+`companyfacts` into Tier 0 through the same rate-limited client — **superseding** the
+prior copy with a higher ingest-monotonic version — then re-derives its canonical
+Tier 1, which flows to the resolution view and the wide mart automatically. It
+**hits EDGAR and needs a real contact email**, and it takes the **same single-flight
+lease** as backfill/catch-up (so it can't run alongside them — a concurrent trigger
+returns `ALREADY_RUNNING`, exit-0).
+
+- **Manual and targeted.** You name the CIK; there's no automated corruption
+  *detection* in v1. It needs **no `[universe]`** — you can recover any CIK, in your
+  screening scope or not.
+- **Idempotent.** Re-running is safe — the higher version supersedes on read; a
+  clean copy just re-lands over itself.
+
 ## Testing
 
 ```bash
