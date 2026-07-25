@@ -239,8 +239,8 @@ at most one runs at a time:
 - A run paused in an EDGAR **cool-down** keeps heartbeating (a background thread), so
   its lease is not reclaimed while it waits out a throttle.
 
-The lease file holds only `{pid, host, timestamps}` — no secrets — and is runtime
-state (gitignored). Tune `path` / `ttl_seconds` / `heartbeat_seconds` under `[lease]`
+The lease file holds only `{token, pid, host, timestamps, ttl}` — no secrets — and
+is runtime state (gitignored). Tune `path` / `ttl_seconds` / `heartbeat_seconds` under `[lease]`
 in `fintin.toml` (heartbeat must be ≤ half the TTL).
 
 ### Check coverage & status

@@ -53,12 +53,14 @@ def test_stale_lease_is_reclaimed(tmp_path):
 
 def test_heartbeat_keeps_a_live_lease_fresh(tmp_path):
     # AC-3 mechanism: the background heartbeat thread refreshes the lease every
-    # 0.05s, so even after sleeping past the 0.3s TTL the lease is NOT reclaimable.
+    # 0.1s, so even after sleeping past the 1.0s TTL the lease is NOT reclaimable.
+    # Generous margins (10 beats per TTL, a full second of slack) so a scheduling
+    # hiccup on a loaded CI can't spuriously cross the TTL.
     p = str(tmp_path / "x.lease")
-    holder = FileLease(p, ttl_seconds=0.3, heartbeat_seconds=0.05)
+    holder = FileLease(p, ttl_seconds=1.0, heartbeat_seconds=0.1)
     assert holder.acquire() is True
-    time.sleep(0.5)  # well past the TTL — but the heartbeat kept beating
-    contender = FileLease(p, ttl_seconds=0.3, heartbeat_seconds=0.05)
+    time.sleep(1.3)  # well past the TTL — but the heartbeat kept beating
+    contender = FileLease(p, ttl_seconds=1.0, heartbeat_seconds=0.1)
     assert contender.acquire() is False  # still held — heartbeat prevented reclaim
     holder.release()
 
@@ -80,6 +82,18 @@ def test_corrupt_lease_file_is_reclaimed(tmp_path):
     lease = FileLease(str(p), ttl_seconds=5, heartbeat_seconds=1)
     assert lease.acquire() is True  # unparseable → treated as stale → reclaimed
     lease.release()
+
+
+def test_unreadable_lease_is_presumed_live_not_stolen(tmp_path):
+    # Fail-safe: a present-but-UNREADABLE lease must be presumed live and coalesced,
+    # never reclaimed — a lock that steals itself when it can't read the holder is
+    # no lock. Here the lease path is a directory, so reading it raises an OSError
+    # that is NOT "corrupt content" — acquire must return False, not reclaim/crash.
+    p = tmp_path / "x.lease"
+    p.mkdir()
+    lease = FileLease(str(p), ttl_seconds=5, heartbeat_seconds=1)
+    assert lease.acquire() is False  # coalesce, not reclaim, not a crash
+    assert p.is_dir()  # the misconfigured path was left untouched
 
 
 def test_release_is_idempotent_and_ownership_checked(tmp_path):

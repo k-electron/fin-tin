@@ -98,6 +98,10 @@ class ReconcileConfig:
 DEFAULT_LEASE_PATH = "fintin.lease"
 DEFAULT_LEASE_TTL_SECONDS = 120
 DEFAULT_LEASE_HEARTBEAT_SECONDS = 15
+# Upper bound on the TTL — beyond this a crashed run's lease would outlive any sane
+# recovery window and silently defeat the self-expiry guarantee (a fat-fingered
+# ttl_seconds must not deadlock the tool for days).
+MAX_LEASE_TTL_SECONDS = 86400  # 24h
 
 
 @dataclass(frozen=True)
@@ -365,10 +369,11 @@ def _parse_lease(ls: dict, path: Path) -> LeaseConfig:
         raise ConfigError(
             f"[lease].ttl_seconds in {path} must be an integer, got {ttl!r}."
         )
-    if ttl < 2:
+    if not (2 <= ttl <= MAX_LEASE_TTL_SECONDS):
         raise ConfigError(
-            f"[lease].ttl_seconds in {path} must be >= 2 (room for >=2 heartbeats), "
-            f"got {ttl}."
+            f"[lease].ttl_seconds in {path} must be between 2 and "
+            f"{MAX_LEASE_TTL_SECONDS} (>=2 for room for two heartbeats; a huge TTL "
+            f"would defeat self-expiry), got {ttl}."
         )
 
     heartbeat = ls.get("heartbeat_seconds", DEFAULT_LEASE_HEARTBEAT_SECONDS)

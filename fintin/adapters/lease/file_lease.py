@@ -81,25 +81,56 @@ class FileLease:
                 "ttl_seconds": self._ttl_seconds,
             }
             tmp = f"{self._path}.{self._token}.{os.getpid()}.tmp"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                json.dump(record, fh)
             try:
-                # Atomic exclusive claim: link fails if the target already exists,
-                # and the target is fully populated the instant it appears.
-                os.link(tmp, self._path)
-            except FileExistsError:
-                _unlink_quietly(tmp)
-                existing = self._read_record()
-                if existing is not None and not _is_stale(existing, _now()):
-                    return False  # a live run holds the lease — coalesce (AD-12)
-                _unlink_quietly(self._path)  # stale/corrupt → reclaim, then retry
-                continue
-            else:
-                _unlink_quietly(tmp)  # target is hard-linked; drop the temp name
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    json.dump(record, fh)
+                try:
+                    # Atomic exclusive claim: link fails if the target already
+                    # exists, and the target is fully populated the instant it
+                    # appears (no torn-file window a racer could misread).
+                    os.link(tmp, self._path)
+                except FileExistsError:
+                    # A lease file already exists. Reclaim ONLY on positive
+                    # evidence it is dead (stale heartbeat / corrupt / vanished);
+                    # a present-but-unreadable file (I/O error, fd exhaustion, a
+                    # non-file path) is presumed LIVE and coalesced — a lock that
+                    # steals itself when it merely can't read the holder is no lock.
+                    if not self._existing_is_reclaimable(_now()):
+                        return False  # live (or unreadable) holder — coalesce (AD-12)
+                    _unlink_quietly(self._path)  # confirmed dead → reclaim, retry
+                    continue
+                except OSError as exc:
+                    # e.g. the lease path is on a filesystem without hard-link
+                    # support, or is not writable — fail loudly, never silently.
+                    raise OSError(
+                        f"cannot create the single-flight lease at {self._path!r}: {exc}"
+                    ) from exc
                 self._acquired_at = now
                 self._start_heartbeat()
                 return True
-        return False  # someone reclaimed between our unlink and link — coalesce
+            finally:
+                _unlink_quietly(tmp)  # never leak the temp record file
+        return False  # kept losing the reclaim race — another run won it (coalesce)
+
+    def _existing_is_reclaimable(self, now: float) -> bool:
+        """Whether the lease file at ``self._path`` may be reclaimed — ``True`` only
+        on POSITIVE evidence it is dead: vanished, corrupt content (writes are
+        atomic, so this is genuine corruption not a torn write), or a readable
+        record whose heartbeat is older than its TTL. A present-but-unreadable file
+        (I/O error, fd exhaustion, not a regular file) is presumed **live** and is
+        NOT reclaimed — fail-safe: never steal a lock we cannot read."""
+        try:
+            with open(self._path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except FileNotFoundError:
+            return True  # vanished between the link attempt and now — free to claim
+        except (ValueError, UnicodeDecodeError):
+            return True  # corrupt content (atomic writes ⇒ not a torn read)
+        except OSError:
+            return False  # present but unreadable → presume live, do not steal
+        if not isinstance(data, dict):
+            return True  # not a lease record → corrupt
+        return _is_stale(data, now)
 
     def release(self) -> None:
         """Stop heartbeating and remove the lease file — only if we still hold it.
@@ -134,6 +165,8 @@ class FileLease:
                 logger.debug("lease heartbeat write failed", exc_info=True)
 
     def _touch(self) -> None:
+        if self._stop.is_set():
+            return  # released between the interval wait and here — do not write
         record = self._read_record()
         if record is None or record.get("token") != self._token:
             return  # we no longer own the lease (reclaimed elsewhere) — stop
@@ -174,3 +207,8 @@ def _unlink_quietly(path: str) -> None:
         os.unlink(path)
     except FileNotFoundError:
         pass
+    except OSError:
+        # Any other unlink failure (a read-only dir, a path that is a directory,
+        # a permission error) must never propagate — especially from release()'s
+        # `finally`, where it would mask the run's real exception. Best-effort.
+        logger.debug("could not unlink lease file %s", path, exc_info=True)

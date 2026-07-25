@@ -320,6 +320,7 @@ def test_lease_parses(tmp_path):
     [
         "[lease]\nttl_seconds = 20\nheartbeat_seconds = 15\n",  # 2*hb > ttl (not << TTL)
         "[lease]\nttl_seconds = 1\n",  # below the >=2 floor
+        "[lease]\nttl_seconds = 86401\n",  # above the 24h ceiling (would defeat expiry)
         "[lease]\nheartbeat_seconds = 0\n",  # below the >=1 floor
         "[lease]\nttl_seconds = true\n",  # bool masquerading as int
         '[lease]\nttl_seconds = "60"\n',  # not an int
