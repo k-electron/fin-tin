@@ -371,6 +371,54 @@ def test_already_running_is_a_catchup_status_member():
     assert CatchUpStatus.ALREADY_RUNNING.value == "ALREADY_RUNNING"
 
 
+# --- inline Tier 1 projection (passed through to the backfill engine) -----------
+
+
+def test_catch_up_projects_each_affected_company():
+    """A newly-filed or restated report must be queryable when catch-up finishes,
+    not just landed in Tier 0 — so the projection port reaches the engine."""
+    from fintin.core.canonical import ProjectResult
+
+    calls: list[tuple[int, int]] = []
+
+    def _project(cik, position):
+        calls.append((cik, position))
+        return ProjectResult(cik=cik, raw_seen=3, projected=3, version=position)
+
+    strat = _FakeStrategy(facts_by_cik={1: _facts(1), 2: _facts(2)})
+    insert, _, _ = _capturing_insert()
+
+    report = catch_up(
+        _work(_item(1), _item(2)),
+        strategy=strat,
+        insert_rows=insert,
+        taxonomy_version="v",
+        version=1,
+        project_company=_project,
+    )
+
+    assert calls == [(1, 0), (2, 1)]
+    assert report.canonical_rows_landed == 6
+
+
+def test_nothing_to_do_projects_nothing():
+    """An already-current store does no work at all — no fetch, no projection."""
+
+    def _project(cik, position):  # pragma: no cover - must never be called
+        raise AssertionError("projected on an empty work list")
+
+    report = catch_up(
+        _work(),
+        strategy=_FakeStrategy(),
+        insert_rows=_capturing_insert()[0],
+        taxonomy_version="v",
+        version=1,
+        project_company=_project,
+    )
+    assert report.status is CatchUpStatus.NOTHING_TO_DO
+    assert report.canonical_rows_landed == 0
+
+
 # --- purity guard --------------------------------------------------------------
 
 

@@ -5,7 +5,7 @@ on read (readers use ``FINAL``/``argMax``)."""
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 
 from fintin.core.canonical import CanonicalFactRow
 
@@ -47,3 +47,24 @@ def next_canonical_version(client) -> int:
     rows = client.query("SELECT max(version) FROM canonical_fact").result_rows
     current = rows[0][0] if rows and rows[0][0] is not None else 0
     return int(current) + 1
+
+
+def mapped_ciks(client, *, ciks: Collection[int]) -> set[int]:
+    """Of the given ``ciks``, the subset already present in ``canonical_fact``
+    (≥ 1 row) — the Tier 1 counterpart of
+    :func:`~fintin.adapters.store.raw_fact_repo.present_ciks`.
+
+    Backfill's resume test intersects the two: a company counts as done only when
+    **both** tiers hold rows. Tier 0 alone is not enough, because a company whose
+    inline Tier 1 projection failed has raw rows but is not queryable — resuming
+    on Tier 0 presence alone would skip it forever. Parameterized (never
+    string-interpolated). Empty input → ``set()`` with no query. No ``FINAL``:
+    membership is existence."""
+    cik_list = [int(c) for c in ciks]
+    if not cik_list:
+        return set()
+    result = client.query(
+        "SELECT DISTINCT cik FROM canonical_fact WHERE cik IN %(ciks)s",
+        parameters={"ciks": cik_list},
+    )
+    return {int(row[0]) for row in result.result_rows}

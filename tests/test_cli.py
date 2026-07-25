@@ -1049,6 +1049,256 @@ def test_status_fully_covered_has_no_gap_line(tmp_path, status_db, local_clickho
     assert "Traceback" not in res.output
 
 
+# --- populate (the one-shot: schema-init + backfill) ----------------------------
+
+
+def test_populate_runs_schema_init_then_backfill(tmp_path, monkeypatch):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    order: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        app_mod,
+        "schema_init_command",
+        lambda **kw: order.append(("schema-init", kw)),
+    )
+    monkeypatch.setattr(
+        app_mod, "backfill_command", lambda **kw: order.append(("backfill", kw))
+    )
+
+    result = runner.invoke(app, ["populate", "--config", str(p)])
+
+    assert result.exit_code == 0
+    assert [step for step, _ in order] == ["schema-init", "backfill"]  # order matters
+    assert order[1][1] == {"config": p, "refresh": False, "show_gaps": False}
+    assert "screening_wide" in result.output  # tells you how to query it
+
+
+def test_populate_forwards_its_flags(tmp_path, monkeypatch):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    seen: dict = {}
+    monkeypatch.setattr(app_mod, "schema_init_command", lambda **kw: None)
+    monkeypatch.setattr(app_mod, "backfill_command", lambda **kw: seen.update(kw))
+
+    runner.invoke(
+        app, ["populate", "--config", str(p), "--refresh", "--show-gaps"]
+    )
+    assert seen == {"config": p, "refresh": True, "show_gaps": True}
+
+
+def test_populate_stops_if_schema_init_fails(tmp_path, monkeypatch):
+    """A failed schema-init must not be followed by a backfill that would spend
+    EDGAR requests it cannot persist."""
+    import typer as _typer
+
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    called: list[str] = []
+
+    def _fail(**kw):
+        raise _typer.Exit(code=1)
+
+    monkeypatch.setattr(app_mod, "schema_init_command", _fail)
+    monkeypatch.setattr(app_mod, "backfill_command", lambda **kw: called.append("b"))
+
+    result = runner.invoke(app, ["populate", "--config", str(p)])
+    assert result.exit_code == 1
+    assert called == [], "backfill ran after schema-init failed"
+
+
+def test_populate_passes_every_parameter_of_its_callees():
+    """populate calls the command functions directly, so an omitted parameter
+    would silently become typer's OptionInfo sentinel instead of its default.
+    If a callee grows an option, this fails until populate forwards it."""
+    import inspect
+
+    source = inspect.getsource(app_mod.populate_command)
+    for callee in (app_mod.schema_init_command, app_mod.backfill_command):
+        for param in inspect.signature(callee).parameters:
+            assert f"{param}=" in source, (
+                f"populate_command does not pass {callee.__name__}'s "
+                f"'{param}' parameter"
+            )
+
+
+def test_help_lists_populate():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "populate" in result.output
+
+
+# --- universe --refresh-sp500 (fetch is faked; no network in the suite) ---------
+
+_SP500_CSV = (
+    "Symbol,Security,GICS Sector,CIK\n"
+    "AAPL,Apple Inc.,Information Technology,320193\n"
+    "ZZZZ,Unresolvable Corp,Industrials,1234567\n"
+)
+
+
+def _sp500_env(tmp_path, monkeypatch, csv_text=_SP500_CSV):
+    """Config + a faked constituent fetch + a resolver that knows only AAPL."""
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["OLD"]\n')
+    import fintin.adapters.constituents as fetch_mod
+    import fintin.adapters.edgar.universe as uni_mod
+
+    monkeypatch.setattr(fetch_mod, "fetch_constituents_csv", lambda url: csv_text)
+    monkeypatch.setattr(
+        uni_mod, "resolve_tickers", lambda ts: {t: (320193 if t == "AAPL" else None) for t in ts}
+    )
+    return p
+
+
+def test_refresh_sp500_prints_a_block_without_touching_the_config(tmp_path, monkeypatch):
+    p = _sp500_env(tmp_path, monkeypatch)
+    before = p.read_text()
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert result.exit_code == 0
+    assert "[universe]" in result.output and "AAPL" in result.output
+    assert p.read_text() == before, "printed run must not modify the config"
+
+
+def test_refresh_sp500_carries_unresolvable_tickers_as_explicit_ciks(tmp_path, monkeypatch):
+    """The completeness backstop: ZZZZ doesn't resolve offline, but the source
+    gave a CIK, so it lands in [universe].ciks instead of becoming a gap."""
+    p = _sp500_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert "1 carried as explicit CIKs" in result.output
+    assert "1234567" in result.output
+
+
+def test_refresh_sp500_write_updates_config_and_backs_it_up(tmp_path, monkeypatch):
+    import tomllib
+
+    p = _sp500_env(tmp_path, monkeypatch)
+    result = runner.invoke(
+        app, ["universe", "--config", str(p), "--refresh-sp500", "--write"]
+    )
+    assert result.exit_code == 0
+    loaded = tomllib.loads(p.read_text())
+    assert loaded["universe"]["tickers"] == ["AAPL", "ZZZZ"]
+    assert loaded["universe"]["ciks"] == [1234567]
+    assert loaded["clickhouse"]["host"] == "localhost"  # other sections survive
+    backup = tmp_path / "fintin.toml.bak"
+    assert backup.exists() and 'tickers = ["OLD"]' in backup.read_text()
+
+
+def test_refresh_sp500_write_is_recoverable_from_the_backup(tmp_path, monkeypatch):
+    """The backup is the safety net for the section-replacement being string
+    surgery — it must actually restore the original byte-for-byte."""
+    p = _sp500_env(tmp_path, monkeypatch)
+    original = p.read_text()
+    runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500", "--write"])
+    assert (tmp_path / "fintin.toml.bak").read_text() == original
+
+
+def test_refresh_sp500_reports_a_reshaped_source_instead_of_wiping_the_universe(
+    tmp_path, monkeypatch
+):
+    """A source that lost its Symbol column must fail loudly — writing an empty
+    Universe would silently destroy the user's scope."""
+    p = _sp500_env(tmp_path, monkeypatch, csv_text="Name,Sector\nApple,Tech\n")
+    before = p.read_text()
+    result = runner.invoke(
+        app, ["universe", "--config", str(p), "--refresh-sp500", "--write"]
+    )
+    assert result.exit_code == 1
+    assert "Constituent parse failed" in result.output
+    assert p.read_text() == before  # untouched
+    assert "Traceback" not in result.output
+
+
+def test_refresh_sp500_reports_a_fetch_failure_cleanly(tmp_path, monkeypatch):
+    import fintin.adapters.constituents as fetch_mod
+
+    p = _sp500_env(tmp_path, monkeypatch)
+
+    def _boom(url):
+        raise fetch_mod.ConstituentFetchError("HTTP 503")
+
+    monkeypatch.setattr(fetch_mod, "fetch_constituents_csv", _boom)
+    result = runner.invoke(app, ["universe", "--config", str(p), "--refresh-sp500"])
+    assert result.exit_code == 1
+    assert "Constituent fetch failed" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_write_without_refresh_is_rejected(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    result = runner.invoke(app, ["universe", "--config", str(p), "--write"])
+    assert result.exit_code == 2
+    assert "--write only applies" in result.output
+
+
+# --- reset (destructive; the --yes guard is the safety-critical part) -----------
+
+
+def _reset_env(tmp_path, monkeypatch, dropped=("screening_wide", "screening_mart")):
+    """A reset whose store calls are stubbed, so the guard/reporting is testable
+    without a container."""
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)
+    calls: list[str] = []
+    monkeypatch.setattr(app_mod, "check_connection", lambda cfg: "24.1")
+    monkeypatch.setattr(app_mod, "get_client", lambda cfg: None)
+    monkeypatch.setattr(
+        app_mod.store_schema,
+        "drop_schema",
+        lambda client: (calls.append("drop"), list(dropped))[1],
+    )
+    monkeypatch.setattr(
+        app_mod.store_schema,
+        "create_schema",
+        lambda client: (calls.append("create"), ["raw_fact"])[1],
+    )
+    return p, calls
+
+
+def test_reset_without_yes_drops_nothing(tmp_path, monkeypatch):
+    """The guard: no --yes means no DDL is issued at all, and the user is told
+    which database and objects were at stake."""
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p)])
+    assert result.exit_code == 2
+    assert calls == [], "reset issued DDL without --yes"
+    assert "Refusing to drop" in result.output
+    assert "'default'" in result.output  # names the database it would have wiped
+    assert "screening_wide" in result.output  # and the objects
+    assert "Traceback" not in result.output
+
+
+def test_reset_with_yes_drops_and_reports(tmp_path, monkeypatch):
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p), "--yes"])
+    assert result.exit_code == 0
+    assert calls == ["drop"]  # dropped, did NOT recreate
+    assert "Dropped 2 object(s)" in result.output
+    assert "schema-init" in result.output  # tells you how to rebuild
+
+
+def test_reset_recreate_rebuilds_the_empty_schema(tmp_path, monkeypatch):
+    p, calls = _reset_env(tmp_path, monkeypatch)
+    result = runner.invoke(app, ["reset", "--config", str(p), "--yes", "--recreate"])
+    assert result.exit_code == 0
+    assert calls == ["drop", "create"]  # order matters
+    assert "Recreated empty schema" in result.output
+
+
+def test_reset_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["reset", "--config", "does-not-exist.toml", "--yes"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_help_lists_reset():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "reset" in result.output
+
+
 # --- --debug traceback escape hatch (cross-command) ----------------------------
 # Every command's terminal `except Exception` renders a friendly one-liner and
 # discards the stack. `--debug` recovers it without changing the default UX.

@@ -37,6 +37,7 @@ from fintin.core.backfill import (
     BackfillStrategy,
     backfill_universe,
 )
+from fintin.core.canonical import ProjectResult
 from fintin.core.ingest import RawFactRow
 from fintin.core.lease import Lease, run_single_flight
 from fintin.core.reconcile import WorkList
@@ -79,6 +80,10 @@ class CatchUpReport(NamedTuple):
         return self.backfill.rows_landed if self.backfill is not None else 0
 
     @property
+    def canonical_rows_landed(self) -> int:
+        return self.backfill.canonical_rows_landed if self.backfill is not None else 0
+
+    @property
     def failures(self) -> tuple[BackfillFailure, ...]:
         return self.backfill.failures if self.backfill is not None else ()
 
@@ -107,6 +112,7 @@ def catch_up(
     max_consecutive_failures: int | None = None,
     on_company: Callable[[BackfillEvent], None] | None = None,
     on_status: Callable[[CatchUpStatus], None] | None = None,
+    project_company: Callable[[int, int], ProjectResult] | None = None,
 ) -> CatchUpReport:
     """Catch the store up to ``work``. Pure (no I/O): the CLI has already run
     discovery (the Epic 2 reconciler) and passes the finished :class:`WorkList` in.
@@ -145,6 +151,7 @@ def catch_up(
         fatal_errors=fatal_errors,
         max_consecutive_failures=max_consecutive_failures,
         on_company=on_company,
+        project_company=project_company,
     )
     # Only reached if backfill_universe returned normally — a fatal_errors type or
     # BackfillAborted propagates through, so COMPLETED is never emitted on abort.

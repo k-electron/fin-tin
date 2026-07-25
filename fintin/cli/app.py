@@ -176,6 +176,142 @@ def schema_init_command(
     )
 
 
+@app.command("populate")
+def populate_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Re-ingest companies already in the store (supersedes on read).",
+    ),
+    show_gaps: bool = typer.Option(
+        False,
+        "--show-gaps",
+        help="List every company recorded as an explained gap.",
+    ),
+) -> None:
+    """Take an empty store to a queryable one: schema-init, then backfill.
+
+    The one command a fresh checkout needs. Equivalent to running `schema-init`
+    followed by `backfill` — backfill derives canonical Tier 1 per company as it
+    goes, so the screening views are populated when this finishes. Resumable: an
+    interrupted run just needs re-running (companies already complete are
+    skipped). Hits EDGAR, so it needs a real contact_email."""
+    _configure_logging()
+
+    # Calls the command functions directly rather than re-implementing either.
+    # EVERY parameter must be passed explicitly: an omitted one would arrive as
+    # typer's `OptionInfo` sentinel rather than its default, so
+    # `test_populate_passes_every_parameter_of_its_callees` guards against a
+    # callee growing an option this forgets.
+    typer.secho("[1/2] Creating the store schema...", fg=typer.colors.BLUE)
+    schema_init_command(config=config)
+
+    typer.secho(
+        "\n[2/2] Backfilling the Universe (this hits EDGAR and can take a while)...",
+        fg=typer.colors.BLUE,
+    )
+    backfill_command(config=config, refresh=refresh, show_gaps=show_gaps)
+
+    typer.secho(
+        "\nStore populated. Query it with `screening_wide` / `screening_mart`, "
+        "check coverage with `fintin status`, and keep it current with "
+        "`fintin catch-up`.",
+        fg=typer.colors.GREEN,
+    )
+
+
+@app.command("reset")
+def reset_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        help="Confirm the wipe. Without it, reset reports what it WOULD drop and stops.",
+    ),
+    recreate: bool = typer.Option(
+        False,
+        "--recreate",
+        help="Recreate the empty schema after dropping (equivalent to a following schema-init).",
+    ),
+) -> None:
+    """Drop every fin-tin object, wiping the corpus — start over from scratch."""
+    _configure_logging()
+    try:
+        cfg = load_config(config)
+    except ConfigError as exc:
+        typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
+
+    try:
+        check_connection(cfg.clickhouse)
+    except StoreConnectionError as exc:
+        typer.secho(f"Connection failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    targets = [obj.name for obj in store_schema.SCHEMA_STATEMENTS]
+    if not yes:
+        # Destructive and irreversible from the tool's side — make the operator
+        # say so explicitly. Naming the database matters: the same command run
+        # against the wrong config would wipe a different store.
+        typer.secho(
+            f"Refusing to drop {len(targets)} object(s) in database "
+            f"'{cfg.clickhouse.database}' without --yes: {', '.join(targets)}.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        typer.secho(
+            "Re-run with --yes to wipe (add --recreate to leave an empty schema "
+            "ready). The corpus is re-derivable from EDGAR with `fintin populate`.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    logger.info(
+        "Dropping fin-tin objects in ClickHouse %s:%s (database=%s)",
+        cfg.clickhouse.host,
+        cfg.clickhouse.port,
+        cfg.clickhouse.database,
+    )
+
+    client = None
+    try:
+        client = get_client(cfg.clickhouse)
+        dropped = store_schema.drop_schema(client)
+        created = store_schema.create_schema(client) if recreate else []
+    except Exception as exc:  # DDL error (connection already verified above)
+        raise _fail_unexpected("Reset failed", exc)
+    finally:
+        if client is not None:
+            with contextlib.suppress(Exception):
+                client.close()
+
+    typer.secho(
+        f"Dropped {len(dropped)} object(s) from '{cfg.clickhouse.database}': "
+        f"{', '.join(dropped)}.",
+        fg=typer.colors.GREEN,
+    )
+    if recreate:
+        typer.secho(
+            f"Recreated empty schema: {', '.join(created)}.", fg=typer.colors.GREEN
+        )
+    else:
+        typer.secho(
+            "Run `fintin schema-init` (or `fintin populate`) to rebuild.",
+            fg=typer.colors.YELLOW,
+        )
+
+
 @app.command("ingest-company")
 def ingest_company_command(
     cik: int = typer.Argument(..., help="SEC CIK of the company to ingest (e.g. 320193)."),
@@ -354,6 +490,118 @@ def map_canonical_command(
     )
 
 
+def _refresh_sp500(cfg, *, config_path: Path, write: bool) -> None:
+    """Fetch S&P 500 constituents and emit a [universe] block (optionally writing it).
+
+    Split out of `universe_command` because it is a different operation that
+    happens to share the noun: it reaches the network (a non-EDGAR host) and
+    produces config, where the command's normal mode is offline and read-only."""
+    from fintin.adapters.constituents import (
+        DEFAULT_CONSTITUENTS_URL,
+        ConstituentFetchError,
+        fetch_constituents_csv,
+    )
+    from fintin.adapters.edgar.universe import resolve_tickers
+    from fintin.core.constituents import (
+        parse_constituents_csv,
+        render_universe_block,
+        replace_universe_section,
+    )
+
+    url = (cfg.universe.constituents_url if cfg.universe else None) or (
+        DEFAULT_CONSTITUENTS_URL
+    )
+    logger.info("Fetching S&P 500 constituents from %s", url)
+    try:
+        csv_text = fetch_constituents_csv(url)
+        parsed = parse_constituents_csv(csv_text)
+    except ConstituentFetchError as exc:
+        typer.secho(f"Constituent fetch failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+    except ValueError as exc:  # unparseable / wrong-shape CSV
+        typer.secho(f"Constituent parse failed: {exc}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+    if not parsed.constituents:
+        typer.secho(
+            f"Constituent source at {url} yielded no companies.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    tickers = parsed.tickers
+    # Which of these does edgartools resolve offline? Any that don't would become
+    # explained gaps at backfill time — but the source usually supplies a CIK, so
+    # carry those into [universe].ciks and the Universe stays complete.
+    try:
+        resolved = resolve_tickers(list(tickers))
+    except Exception as exc:
+        raise _fail_unexpected("Ticker resolution failed", exc)
+
+    unresolved = [t for t in tickers if resolved.get(t) is None]
+    rescued = tuple(
+        sorted(
+            c.cik
+            for c in parsed.with_cik
+            if c.cik is not None and c.ticker in set(unresolved)
+        )
+    )
+    still_missing = [
+        t
+        for t in unresolved
+        if not any(c.ticker == t and c.cik is not None for c in parsed.constituents)
+    ]
+
+    block = render_universe_block(tickers, rescued)
+    if cfg.universe is not None and cfg.universe.constituents_url:
+        block += f'\nconstituents_url = "{cfg.universe.constituents_url}"'
+
+    typer.secho(
+        f"Fetched {len(tickers)} constituents from {url}: "
+        f"{len(tickers) - len(unresolved)} resolve offline, "
+        f"{len(rescued)} carried as explicit CIKs, {len(still_missing)} unresolvable.",
+        fg=typer.colors.GREEN,
+    )
+    for note in parsed.skipped:
+        typer.secho(f"  skipped: {note}", fg=typer.colors.YELLOW)
+    if still_missing:
+        typer.secho(
+            "  no CIK available for: " + ", ".join(still_missing),
+            fg=typer.colors.YELLOW,
+        )
+
+    if not write:
+        typer.secho(
+            f"\n# Paste into {config_path} (or re-run with --write):",
+            fg=typer.colors.BLUE,
+        )
+        typer.echo(block)
+        return
+
+    original = config_path.read_text()
+    try:
+        updated = replace_universe_section(original, block)
+    except ValueError:
+        updated = original.rstrip("\n") + "\n\n" + block + "\n"
+        typer.secho(
+            f"No [universe] section in {config_path} — appended one.",
+            fg=typer.colors.YELLOW,
+        )
+    backup = config_path.with_suffix(config_path.suffix + ".bak")
+    backup.write_text(original)
+    config_path.write_text(updated)
+    typer.secho(
+        f"Wrote [universe] to {config_path} ({len(tickers)} tickers, "
+        f"{len(rescued)} CIKs). Previous version saved to {backup}.",
+        fg=typer.colors.GREEN,
+    )
+    typer.secho(
+        "Note: comments inside the [universe] section were replaced.",
+        fg=typer.colors.YELLOW,
+    )
+
+
 @app.command("universe")
 def universe_command(
     config: Path = typer.Option(
@@ -367,18 +615,41 @@ def universe_command(
         "--show-ciks",
         help="Also print the full sorted list of resolved CIKs.",
     ),
+    refresh_sp500: bool = typer.Option(
+        False,
+        "--refresh-sp500",
+        help="Fetch the current S&P 500 constituents and print a [universe] block.",
+    ),
+    write: bool = typer.Option(
+        False,
+        "--write",
+        help="With --refresh-sp500: rewrite the [universe] section in the config (backs it up first).",
+    ),
 ) -> None:
     """Resolve the configured [universe] to CIKs and report scope + explained gaps.
 
     Offline: tickers resolve via edgartools' bundled reference table (no EDGAR
     request, no contact email needed). Unresolvable tickers are reported as
-    explained gaps, never silently dropped."""
+    explained gaps, never silently dropped.
+
+    --refresh-sp500 instead fetches the current S&P 500 constituent list (one
+    non-EDGAR HTTP GET) and emits a ready-to-use [universe] block."""
     _configure_logging()
+    if write and not refresh_sp500:
+        typer.secho(
+            "--write only applies with --refresh-sp500.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+
     try:
         cfg = load_config(config)
     except ConfigError as exc:
         typer.secho(f"Config error: {exc}", fg=typer.colors.RED, err=True)
         raise typer.Exit(code=2)
+
+    if refresh_sp500:
+        _refresh_sp500(cfg, config_path=config, write=write)
+        return
 
     if cfg.universe is None:
         typer.secho(
@@ -596,7 +867,14 @@ def backfill_command(
         present_ciks,
     )
     from fintin.adapters.lease.file_lease import FileLease
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        mapped_ciks,
+        next_canonical_version,
+    )
+    from fintin.adapters.store.raw_fact_repo import read_raw_facts
     from fintin.core.backfill import BackfillAborted, backfill_universe
+    from fintin.core.canonical import map_company
     from fintin.core.lease import run_single_flight
     from fintin.core.universe import resolve_universe
 
@@ -659,9 +937,22 @@ def backfill_command(
             # it per company so a shared cross-company accession resolves
             # deterministically.
             version = next_ingest_version(client)
-            # Resume: skip companies already present (derived from the store, not a
-            # checkpoint — AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
-            present = set() if refresh else present_ciks(client, ciks=resolved.ciks)
+            # One canonical version base per run too (Tier 1 has its own monotonic
+            # sequence, AD-6); the engine's per-company position offsets it exactly
+            # as it offsets the raw version, so both tiers stay deterministic.
+            canonical_base = next_canonical_version(client)
+            # Resume: skip companies already DONE — present in BOTH tiers. Tier 0
+            # alone would skip a company whose projection failed, leaving it
+            # permanently unqueryable (derived from the store, not a checkpoint —
+            # AD-1/AD-11/AD-16). --refresh re-ingests all (supersedes).
+            present = (
+                set()
+                if refresh
+                else (
+                    present_ciks(client, ciks=resolved.ciks)
+                    & mapped_ciks(client, ciks=resolved.ciks)
+                )
+            )
             return backfill_universe(
                 resolved.ciks,
                 strategy=CompanyFactsStrategy(edgar_client),
@@ -672,6 +963,14 @@ def backfill_command(
                 fatal_errors=(EdgarThrottleError,),  # throttle exhausted → abort (SM-C1)
                 max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
                 on_company=_log_company,
+                # Derive Tier 1 per company, so the run leaves the store queryable
+                # (mart included) instead of Tier-0-only.
+                project_company=lambda c, position: map_company(
+                    c,
+                    read_raw_facts=lambda x: read_raw_facts(client, x),
+                    insert_rows=lambda rows: insert_canonical_facts(client, rows),
+                    version=canonical_base + position,
+                ),
             )
         finally:
             with contextlib.suppress(Exception):
@@ -711,7 +1010,8 @@ def backfill_command(
     noun = "company" if report.companies_ingested == 1 else "companies"
     typer.secho(
         f"Backfill complete: {report.companies_ingested} {noun} ingested "
-        f"({report.rows_landed} facts landed), "
+        f"({report.rows_landed} facts landed, "
+        f"{report.canonical_rows_landed} projected to canonical Tier 1), "
         f"{report.companies_skipped} already present, "
         f"{report.companies_failed} failed "
         f"into database '{cfg.clickhouse.database}'.",
@@ -768,9 +1068,15 @@ def catch_up_command(
         insert_raw_facts,
         next_ingest_version,
         present_accessions,
+        read_raw_facts,
     )
     from fintin.adapters.lease.file_lease import FileLease
+    from fintin.adapters.store.canonical_fact_repo import (
+        insert_canonical_facts,
+        next_canonical_version,
+    )
     from fintin.core.backfill import BackfillAborted, BackfillEvent
+    from fintin.core.canonical import map_company
     from fintin.core.catchup import CatchUpStatus, catch_up, catch_up_single_flight
     from fintin.core.reconcile import compute_work_list, resolve_window
     from fintin.core.universe import resolve_universe
@@ -852,6 +1158,7 @@ def catch_up_command(
             # One ingest-monotonic version base per run (AD-6); the engine offsets
             # it per affected company.
             version = next_ingest_version(client)
+            canonical_base = next_canonical_version(client)
             return catch_up(
                 work,
                 strategy=CompanyFactsStrategy(edgar_client),
@@ -862,6 +1169,14 @@ def catch_up_command(
                 max_consecutive_failures=_MAX_CONSECUTIVE_FAILURES,
                 on_company=_log_company,
                 on_status=_log_status,
+                # Re-derive Tier 1 for each affected company, so a newly-filed or
+                # restated report is queryable the moment catch-up finishes.
+                project_company=lambda c, position: map_company(
+                    c,
+                    read_raw_facts=lambda x: read_raw_facts(client, x),
+                    insert_rows=lambda rows: insert_canonical_facts(client, rows),
+                    version=canonical_base + position,
+                ),
             )
         finally:
             with contextlib.suppress(Exception):

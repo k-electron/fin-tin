@@ -17,6 +17,7 @@ import pytest
 from fintin.adapters.store import schema as store_schema
 from fintin.adapters.store.canonical_fact_repo import (
     insert_canonical_facts,
+    mapped_ciks,
     next_canonical_version,
 )
 from fintin.adapters.store.client import get_client
@@ -223,3 +224,47 @@ def test_first_present_precedence_deterministic(schema_client):
         "WHERE cik = 320193 AND period_start = '2023-01-01' AND period_end = '2023-12-31'"
     ).result_rows[0][0]
     assert val == 900.0  # position-1 element wins deterministically
+
+
+# --- mapped_ciks: the Tier 1 half of backfill's both-tier resume test ------------
+
+
+@pytest.mark.integration
+def test_mapped_ciks_reports_only_companies_present_in_tier1(schema_client):
+    insert_canonical_facts(schema_client, [_canon(cik=320193)])
+    # Asked about three, only the one with Tier 1 rows comes back.
+    assert mapped_ciks(schema_client, ciks=[320193, 789019, 1652044]) == {320193}
+
+
+@pytest.mark.integration
+def test_mapped_ciks_empty_input_is_a_noop(schema_client):
+    assert mapped_ciks(schema_client, ciks=[]) == set()
+
+
+@pytest.mark.integration
+def test_tier_split_company_is_not_counted_as_done(schema_client):
+    """The hazard the both-tier resume test exists for: a company whose Tier 0
+    landed but whose projection failed has raw rows and NO canonical rows, so
+    `present_ciks & mapped_ciks` must exclude it and a resumed backfill retries it
+    (rather than skipping it forever on Tier 0 presence alone)."""
+    from fintin.adapters.store.raw_fact_repo import present_ciks
+
+    insert_raw_facts(
+        schema_client,
+        [
+            RawFactRow(
+                cik=999, accession="0000000999-24-000001", raw_tag="us-gaap:Revenues",
+                raw_label="Revenues", taxonomy="us-gaap",
+                period_start=date(2023, 1, 1), period_end=date(2023, 12, 31),
+                unit="USD", value=5.0, form="10-K", filed_date=date(2024, 2, 1),
+                content_hash="split", taxonomy_version="5.43.0", version=1,
+            )
+        ],
+    )
+    scope = [999]
+    assert present_ciks(schema_client, ciks=scope) == {999}  # Tier 0 present
+    assert mapped_ciks(schema_client, ciks=scope) == set()  # Tier 1 absent
+    done = present_ciks(schema_client, ciks=scope) & mapped_ciks(
+        schema_client, ciks=scope
+    )
+    assert done == set(), "a tier-split company must not count as already done"

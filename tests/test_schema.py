@@ -115,6 +115,60 @@ def test_schema_init_is_idempotent(schema_client):
 
 
 @pytest.mark.integration
+def test_drop_schema_removes_every_object_and_is_idempotent(schema_client):
+    """`drop_schema` wipes exactly what `create_schema` made, and a second drop on
+    the now-empty database is a no-op rather than an error."""
+    client, db = schema_client
+    store_schema.create_schema(client)
+
+    def _names():
+        return {
+            r[0]
+            for r in client.query(
+                f"SELECT name FROM system.tables WHERE database = '{db}'"
+            ).result_rows
+        }
+
+    assert _names(), "nothing created, so the drop below would prove nothing"
+    dropped = store_schema.drop_schema(client)
+    assert set(dropped) == {obj.name for obj in store_schema.SCHEMA_STATEMENTS}
+    assert _names() == set()
+    assert store_schema.drop_schema(client) == dropped  # idempotent
+
+
+@pytest.mark.integration
+def test_drop_schema_leaves_foreign_objects_alone(schema_client):
+    """The wipe is scoped to fin-tin's declared objects — a neighbouring table in
+    the same database survives (this is the difference from nuking the volume)."""
+    client, db = schema_client
+    store_schema.create_schema(client)
+    client.command("CREATE TABLE not_ours (x UInt8) ENGINE = MergeTree ORDER BY x")
+
+    store_schema.drop_schema(client)
+
+    names = {
+        r[0]
+        for r in client.query(
+            f"SELECT name FROM system.tables WHERE database = '{db}'"
+        ).result_rows
+    }
+    assert names == {"not_ours"}
+    client.command("DROP TABLE not_ours")
+
+
+@pytest.mark.integration
+def test_drop_then_create_round_trips(schema_client):
+    """Reset --recreate: a wipe followed by a rebuild yields the same object set."""
+    client, db = schema_client
+    before = set(store_schema.create_schema(client))
+    store_schema.drop_schema(client)
+    after = set(store_schema.create_schema(client))
+    assert before == after
+    rows = client.query("SELECT count() FROM raw_fact").result_rows[0][0]
+    assert rows == 0  # rebuilt empty
+
+
+@pytest.mark.integration
 def test_instant_and_duration_representation(schema_client):
     """AC-4: instant facts store period_start == period_end; duration start < end,
     and both flow through the MV into the wide mart."""

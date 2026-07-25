@@ -30,7 +30,18 @@ max_throttle_retries = 3               # cool-down + retry attempts before faili
 [universe]
 # The screening Universe: a static list of tickers and/or CIKs (FR-7, AD-13).
 # Tickers and CIKs are PUBLIC data (safe to commit here) — unlike contact_email.
-# Populate the full S&P 500 list below; this is just a representative sample.
+#
+# The sample below is a handful of large caps so a fresh checkout works out of the
+# box. For the FULL S&P 500 (503 listings, dual share classes included), fetch the
+# current constituents and rewrite this section:
+#
+#     fintin universe --refresh-sp500            # print the block, paste it yourself
+#     fintin universe --refresh-sp500 --write    # rewrite this section (backs up first)
+#
+# That is one non-EDGAR HTTP GET (the SEC doesn't publish index membership), so it
+# needs no contact email and spends no EDGAR request budget. Symbols the bundled
+# reference table can't resolve are carried into `ciks` from the source's own CIK
+# column, so the Universe stays complete instead of accruing gaps.
 #
 # Tickers resolve to CIKs OFFLINE via edgartools' bundled reference table (no
 # EDGAR request, no email needed) — run `fintin universe` to resolve & report
@@ -44,6 +55,10 @@ tickers = [
 ciks = [
     1652044,   # Alphabet — example of a direct CIK entry (skips ticker resolution)
 ]
+# Where --refresh-sp500 fetches from. Optional — omit to use the pinned default
+# (a public CSV of S&P 500 members carrying both Symbol and CIK columns). Override
+# it to track a different index, or to pin your own copy if the source moves.
+# constituents_url = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
 
 [reconcile]
 # Work-list tuning (optional; omit to use the default). lookback_days sizes the

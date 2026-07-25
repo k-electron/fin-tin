@@ -15,6 +15,12 @@ build/
 # Copy fintin.toml.example -> fintin.toml and edit locally.
 fintin.toml
 
+# Config backups written by `fintin universe --refresh-sp500 --write`. These are
+# copies of fintin.toml and therefore contain the real contact email — same
+# secret, so the same rule applies.
+fintin.toml.bak
+*.toml.bak
+
 # Single-flight lease file (runtime state; the default [lease].path). If you set a
 # custom lease path in fintin.toml, that file is runtime state too — ignore it.
 fintin.lease

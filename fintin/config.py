@@ -67,6 +67,10 @@ class UniverseConfig:
 
     tickers: tuple[str, ...]
     ciks: tuple[int, ...]
+    # Where `fintin universe --refresh-sp500` fetches the constituent list from.
+    # None → the adapter's pinned default. Only that command reads it; ordinary
+    # Universe resolution stays offline.
+    constituents_url: str | None = None
 
 
 # CIK is a UInt32 in the store (AD "Identity" convention), so 1..2^32-1.
@@ -335,7 +339,18 @@ def _parse_universe(un: dict, path: Path) -> UniverseConfig:
             f"[universe] in {path} is empty — list at least one ticker or cik."
         )
 
-    return UniverseConfig(tickers=tuple(tickers), ciks=tuple(ciks))
+    url = un.get("constituents_url")
+    if url is not None and (not isinstance(url, str) or not url.strip()):
+        raise ConfigError(
+            f"[universe].constituents_url in {path} must be a non-empty string, "
+            f"got {url!r}."
+        )
+
+    return UniverseConfig(
+        tickers=tuple(tickers),
+        ciks=tuple(ciks),
+        constituents_url=url.strip() if isinstance(url, str) else None,
+    )
 
 
 def _parse_reconcile(rc: dict, path: Path) -> ReconcileConfig:
