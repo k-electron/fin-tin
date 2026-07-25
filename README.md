@@ -277,17 +277,19 @@ uv run fintin recover --cik 320193   # re-ingest CIK 320193 and rebuild Tier 0 �
 
 It's a **scoped re-ingest**, not a new subsystem: it re-lands the company's full
 `companyfacts` into Tier 0 through the same rate-limited client — **superseding** the
-prior copy with a higher ingest-monotonic version — then re-derives its canonical
-Tier 1, which flows to the resolution view and the wide mart automatically. It
-**hits EDGAR and needs a real contact email**, and it takes the **same single-flight
-lease** as backfill/catch-up (so it can't run alongside them — a concurrent trigger
-returns `ALREADY_RUNNING`, exit-0).
+prior values (by a higher ingest-monotonic version, on matching identity keys) —
+then re-derives its canonical Tier 1, which flows to the resolution view and the
+wide mart automatically. It **hits EDGAR and needs a real contact email**, and it
+takes the **same single-flight lease** as backfill/catch-up (so it can't run
+alongside them — a concurrent trigger returns `ALREADY_RUNNING`, exit-0).
 
 - **Manual and targeted.** You name the CIK; there's no automated corruption
   *detection* in v1. It needs **no `[universe]`** — you can recover any CIK, in your
   screening scope or not.
-- **Idempotent.** Re-running is safe — the higher version supersedes on read; a
-  clean copy just re-lands over itself.
+- **Idempotent, insert-only.** Re-running is safe — the higher version supersedes on
+  read. Like `backfill --refresh`, it supersedes values on matching identity keys but
+  **cannot retract** a row the fresh fetch no longer contains (a key-field-mangled or
+  vanished fact); that class of repair is out of v1 scope.
 
 ## Testing
 

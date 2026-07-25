@@ -1011,8 +1011,8 @@ def status_command(
 
 @app.command("recover")
 def recover_command(
-    cik: int = typer.Argument(
-        ..., help="SEC CIK to re-fetch and rebuild from EDGAR (e.g. 320193)."
+    cik: int = typer.Option(
+        ..., "--cik", help="SEC CIK to re-fetch and rebuild from EDGAR (e.g. 320193)."
     ),
     config: Path = typer.Option(
         Path("fintin.toml"),
@@ -1021,14 +1021,15 @@ def recover_command(
         help="Path to the fintin.toml config file.",
     ),
 ) -> None:
-    """Repair one company: re-fetch its facts from EDGAR and rebuild Tier 0 → Tier 1 → mart.
+    """Repair one company: re-fetch its facts from EDGAR and rebuild Tier 0 -> Tier 1 -> mart.
 
-    A scoped re-ingest (FR-6, AD-14): re-lands the company's `companyfacts` into
-    Tier 0 through the one rate-limited client — superseding any corrupt/lost prior
-    copy with a higher ingest-monotonic version — then re-derives its canonical
-    Tier 1 (which flows to the resolution MV and the wide mart). Manually targeted
-    (no auto-detection); reuses the existing ingest machinery and the shared
-    single-flight lease. Needs no [universe]; targets any CIK."""
+    A scoped re-ingest (FR-6, AD-14): re-lands the company's companyfacts into
+    Tier 0 through the one rate-limited client — superseding a corrupt/lost prior
+    copy (on matching identity keys) with a higher ingest-monotonic version — then
+    re-derives its canonical Tier 1 (which flows to the resolution MV and the wide
+    mart). Manually targeted (no auto-detection); reuses the existing ingest
+    machinery and the shared single-flight lease. Needs no universe config; targets
+    any CIK."""
     _configure_logging()
     # Heavy `edgar` imports deferred so --help / config-error paths stay fast.
     from fintin.adapters.edgar.client import (
@@ -1136,6 +1137,17 @@ def recover_command(
             "Another run is already active — ALREADY_RUNNING "
             "(nothing to do; no EDGAR request issued).",
             fg=typer.colors.GREEN,
+        )
+        return
+
+    # Honest reporting: when EDGAR returned nothing ingestable, don't claim a
+    # re-ingest/re-derivation that didn't happen — Tier 0 is left as it was.
+    if report.rows_landed == 0:
+        typer.secho(
+            f"Recover CIK {cik}: EDGAR returned no ingestable facts — Tier 0 left "
+            f"unchanged ({report.projected} row(s) re-projected to Tier 1 from "
+            f"existing data) in database '{cfg.clickhouse.database}'.",
+            fg=typer.colors.YELLOW,
         )
         return
 

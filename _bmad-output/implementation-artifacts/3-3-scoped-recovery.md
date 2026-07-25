@@ -4,7 +4,7 @@ baseline_commit: 26a049c78abaf112c5cb1436e9ce41e777b6db8d
 
 # Story 3.3: Scoped recovery
 
-Status: review
+Status: done
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -54,7 +54,7 @@ so that I can repair Tier 0 corruption or loss without a new subsystem.
   - [x] `README.md`: a "Recover a company (repair Tier 0)" section — `fintin recover --cik X`; re-fetches one company's `companyfacts` through the throttled client + shared lease, supersedes the prior copy by version, and re-derives Tier 1 → resolution → mart; manual/targeted (no auto-detection); needs no `[universe]`.
   - [x] `fintin.toml.example` needs **no** change (recover reuses `[clickhouse]`/`[edgar]`/`[lease]`).
   - [x] `deferred-work.md`: note `--accession`-scoped recovery deferred (per-accession fetch, tied to the Story 3.1/AD-13 defer); note automated corruption detection / at-rest scrub is out of v1 scope (Should/Won't); note recovery re-fetches full `companyfacts` (same per-company granularity as catch-up).
-  - [x] (Optional) Live smoke: `fintin recover --cik 320193` against the local `default` DB (scratchpad config, real email, removed after) — re-ingests Apple + re-maps Tier 1; a second concurrent recover → `ALREADY_RUNNING`.
+  - [~] (Optional) Live smoke — **SKIPPED by choice**: `recover` = `ingest-company` + `map-canonical` composed (both already live-smoked in earlier stories), and a live `recover` logs the EDGAR contact-email identity line (a PII risk into any transcript), so the offline-covered composition was not re-smoked live.
 
 ## Dev Notes
 
@@ -129,6 +129,20 @@ The re-ingest lands the fresh Tier 0 at a strictly higher version → supersedes
 - [Source: _bmad-output/implementation-artifacts/1-4-land-raw-facts.md + 1-5-map-canonical-tier1.md — `ingest_company`/`map_company` recover reuses]
 - [Source: _bmad-output/implementation-artifacts/3-2-single-flight-lease.md — `FileLease`/`run_single_flight`, the shared-lease + `ALREADY_RUNNING` wiring recover reuses]
 
+## Review Findings
+
+Reviewed 2026-07-25 by 3 parallel adversarial layers (Blind Hunter, Edge Case Hunter, Acceptance Auditor), all completed. **All 5 ACs + 8 settled decisions verified genuinely satisfied; no Critical/High.** Independently confirmed: the thin reuse (`recover_company` composes `ingest_company` + `map_company`, no re-implementation), purity (AST-guarded), the re-ingest→re-map ordering + read-after-write (synchronous inserts), store-derived monotonic versions (AD-6), the shared-lease coalesce with no EDGAR request, correct exit codes / handler ordering, `schema.py` + `fintin.toml.example` untouched (no new DDL/config), and no `[universe]` read. Triage: **5 patch, 2 defer, 3 dismissed.**
+
+- [x] [Review][Patch] **`--cik` was documented as a flag but implemented positional — the README's command errored** — the AC, epic, PRD, and README all say `fintin recover --cik X`, but the code used `typer.Argument` (positional), so the shipped copy-paste example `fintin recover --cik 320193` failed with "No such option: --cik". Changed the CLI to `typer.Option(..., "--cik")` (matching the AC/docs) and updated the recover CLI tests to `["recover", "--cik", …]`. [fintin/cli/app.py, tests/test_cli.py]
+- [x] [Review][Patch] **Zero-landed run overclaimed "N re-ingested … resolution + mart re-derived"** — when EDGAR returns a non-`None` but empty/all-filtered fetch, `rows_landed == 0` yet the GREEN line claimed a re-ingest + re-derivation that didn't happen. Added an honest `rows_landed == 0` branch: YELLOW "EDGAR returned no ingestable facts — Tier 0 left unchanged (M re-projected from existing data)", exit 0. Added CLI render tests for both the GREEN (facts landed) and YELLOW (zero-landed) branches. [fintin/cli/app.py, tests/test_cli.py]
+- [x] [Review][Patch] **README overstated "corrupted or lost" / "idempotent"** — insert-only supersession (AD-6) only overrides *matching* identity keys; a key-field-mangled or vanished fact isn't retracted. Scoped the wording to "supersedes values on matching identity keys" and noted (like `backfill --refresh`) it cannot retract rows absent from the fresh fetch. [README.md]
+- [x] [Review][Patch] **`recover --help` ate `[universe]` (Rich markup)** — the docstring's literal `[universe]` was consumed as console markup, rendering "Needs no ; targets any CIK". Reworded to "Needs no universe config; targets any CIK." (and de-marked the arrows). [fintin/cli/app.py]
+- [x] [Review][Patch] **Optional-smoke subtask marked `[x]` but skipped** — corrected the checkbox to `[~] SKIPPED by choice` with the rationale (recover = ingest-company + map-canonical, both live-smoked; a live recover logs the contact email). [3-3-scoped-recovery.md]
+- [x] [Review][Defer] **Partial-recovery inconsistency window** [fintin/cli/app.py] — Tier 0 re-landed but the Tier 1 re-map raises → a transient Tier0/mart split; self-healing on re-run, and ClickHouse offers no cross-statement transaction to wrap it. Logged (optionally surface a "re-run to finish" hint).
+- [x] [Review][Defer] **Read-after-write rests on synchronous inserts** [fintin/adapters/store/client.py] — the re-map's `raw_fact FINAL` read sees the just-inserted Tier 0 only because no `async_insert` is configured; if async inserts are ever adopted, add a sync barrier before the re-map. Logged.
+
+_Dismissed (3, with rationale): (a) **the shared lease doesn't cover `ingest-company`/`map-canonical`'s version-sequence race** — pre-existing and already deferred (story-1.5 `next_canonical_version` read-then-increment); recover correctly takes the lease. (b) **`EdgarClient(cfg)` construction guards only `EdgarConfigError`** — the established cross-command pattern; `__init__` only raises `EdgarConfigError` by design. (c) **a store drop between `check_connection` and `get_client` renders generic "Recovery failed" not "Connection failed"** — exit code still 1, no traceback; label specificity is cosmetic and matches the other commands._
+
 ## Dev Agent Record
 
 ### Agent Model Used
@@ -161,5 +175,6 @@ claude-opus-4-8[1m] (Opus 4.8, 1M context)
 
 ## Change Log
 
+- 2026-07-25 — Code review (3 parallel adversarial layers). All 5 ACs + 8 decisions verified; no Critical/High. Applied all **5 patch findings**: (P1) `--cik` made a `typer.Option` so the documented `recover --cik X` works (was positional — the README example errored); (P2) honest zero-landed render (YELLOW "Tier 0 left unchanged", no overclaimed re-derivation) + both render branches now CLI-tested; (P3) scoped the README supersede-by-key wording (can't retract vanished/key-mangled rows, like `--refresh`); (P4) fixed the `--help` `[universe]` Rich-markup garble; (P5) honest optional-smoke checkbox. **2 deferred** (partial-recovery self-healing split; sync-insert read-after-write dependency) and **3 dismissed** (pre-existing version race; EdgarClient-construction guard pattern; connection-drop label), logged. **325 tests pass (+2)**. Secret-scan clean. Status → done.
 - 2026-07-24 — Story 3.3 implemented (red-green-refactor through all 4 tasks). Pure `recover_company` (`core/recover.py`) composes `ingest_company` (Tier 0, supersede by version) + `map_company` (Tier 1 → resolution/mart); `recover --cik X` dumb-trigger CLI reuses the throttled client + the shared single-flight lease (coalesce → `ALREADY_RUNNING`). No new subsystem/DDL/config (AD-14/AD-18); `--cik` only; no `[universe]`. **323 tests pass (+12)**; the coalesce CLI test proves no EDGAR request when the lease is held (NFR-7). Closes Epic 3 (10 CLI commands wired). Status → review.
 - 2026-07-24 — Story 3.3 drafted (substrate analysis: `ingest_company`/`map_company`, the canonical repo, the Story 3.2 lease all read in full). Design settled: `fintin recover --cik X` = a **scoped re-ingest** — a small pure `recover_company` composing `ingest_company` (Tier 0, superseding by version, AD-6) + `map_company` (Tier 1, flows to resolution + mart, Story 1.6), through the one throttled client (AD-3) and the shared single-flight lease (AD-12; coalesce → `ALREADY_RUNNING`). Thin flag, no new subsystem (AD-14); `--cik` only (per-accession deferred, AD-13); no detection/scrub (AC-3); no `[universe]`/DDL/config change. Status → ready-for-dev.

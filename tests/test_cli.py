@@ -637,14 +637,14 @@ def test_help_lists_recover():
 def test_recover_invalid_cik_exits_2():
     # CIK validation precedes config load — a bad CIK fails fast (exit 2), offline.
     for bad in ("0", "5000000000"):  # below 1 and above 2**32-1
-        result = runner.invoke(app, ["recover", bad])
+        result = runner.invoke(app, ["recover", "--cik", bad])
         assert result.exit_code == 2
         assert "Invalid CIK" in result.output
         assert "Traceback" not in result.output
 
 
 def test_recover_missing_config_exits_2():
-    result = runner.invoke(app, ["recover", "320193", "--config", "does-not-exist.toml"])
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", "does-not-exist.toml"])
     assert result.exit_code == 2
     assert "Config error" in result.output
     assert "Traceback" not in result.output
@@ -655,7 +655,7 @@ def test_recover_missing_edgar_exits_2(tmp_path):
     # or ClickHouse access (offline, ban-safe). No [universe] required.
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY)
-    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
     assert result.exit_code == 2
     assert "EDGAR config error" in result.output
     assert "Traceback" not in result.output
@@ -664,7 +664,7 @@ def test_recover_missing_edgar_exits_2(tmp_path):
 def test_recover_placeholder_email_exits_2(tmp_path):
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + _EDGAR_PLACEHOLDER)
-    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
     assert result.exit_code == 2
     assert "EDGAR config error" in result.output
     assert "Traceback" not in result.output
@@ -683,7 +683,7 @@ def test_recover_no_company_facts_exits_1(tmp_path, monkeypatch):
     )
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + _EDGAR_VALID)
-    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
     assert result.exit_code == 1
     assert "companyfacts" in result.output.lower()
     assert "Traceback" not in result.output
@@ -699,7 +699,7 @@ def test_recover_throttle_exits_1(tmp_path, monkeypatch):
     )
     p = tmp_path / "fintin.toml"
     p.write_text(_CH_ONLY + _EDGAR_VALID)
-    result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
     assert result.exit_code == 1
     assert "throttled" in result.output.lower()
     assert "Traceback" not in result.output
@@ -723,12 +723,77 @@ def test_recover_already_running_coalesces_exit_0(tmp_path, monkeypatch):
     try:
         p = tmp_path / "fintin.toml"
         p.write_text(_CH_ONLY + _EDGAR_VALID + f'\n[lease]\npath = "{lease_path}"\n')
-        result = runner.invoke(app, ["recover", "320193", "--config", str(p)])
+        result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
         assert result.exit_code == 0
         assert "ALREADY_RUNNING" in result.output
         assert "Traceback" not in result.output
     finally:
         holder.release()
+
+
+def _recover_report(cik, *, rows_landed, projected, raw_seen):
+    # Build a RecoverReport with the given tallies (the render reads only these).
+    from fintin.core.canonical import ProjectResult
+    from fintin.core.ingest import IngestResult
+    from fintin.core.recover import RecoverReport
+
+    return RecoverReport(
+        cik=cik,
+        ingest=IngestResult(
+            cik=cik,
+            facts_seen=rows_landed,
+            rows_landed=rows_landed,
+            dropped_dimensional=0,
+            dropped_non_standard=0,
+            dropped_non_numeric=0,
+            dropped_incomplete=0,
+            deduped=0,
+            version=3,
+        ),
+        project=ProjectResult(cik=cik, raw_seen=raw_seen, projected=projected, version=4),
+    )
+
+
+def test_recover_success_renders_exit_0(tmp_path, monkeypatch):
+    # The GREEN success render is offline-testable — monkeypatch the engine to
+    # RETURN a report (rows landed) and assert the summary + exit 0.
+    import fintin.core.recover as rec_mod
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        rec_mod,
+        "recover_company",
+        lambda *a, **k: _recover_report(320193, rows_landed=5, projected=5, raw_seen=5),
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + _EDGAR_VALID)
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
+    assert result.exit_code == 0
+    assert "Recovered CIK 320193" in result.output
+    assert "5 facts re-ingested" in result.output
+    assert "resolution + mart re-derived" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_recover_zero_landed_renders_honestly_exit_0(tmp_path, monkeypatch):
+    # When EDGAR returned nothing ingestable, the render must NOT claim a re-ingest /
+    # re-derivation that didn't happen — YELLOW "Tier 0 left unchanged", exit 0.
+    import fintin.core.recover as rec_mod
+
+    _stub_store(monkeypatch)
+    monkeypatch.setattr(
+        rec_mod,
+        "recover_company",
+        lambda *a, **k: _recover_report(320193, rows_landed=0, projected=0, raw_seen=0),
+    )
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + _EDGAR_VALID)
+    result = runner.invoke(app, ["recover", "--cik", "320193", "--config", str(p)])
+    assert result.exit_code == 0
+    assert "no ingestable facts" in result.output
+    assert "Tier 0 left unchanged" in result.output
+    assert "re-ingested into Tier 0," not in result.output  # not the overclaiming line
+    assert "Traceback" not in result.output
 
 
 # --- status (Story 2.4) --------------------------------------------------------
