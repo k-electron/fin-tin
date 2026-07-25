@@ -4,54 +4,111 @@ A locally-hosted query tool that turns SEC EDGAR financial disclosures into a
 clean, normalized, always-current-enough local corpus you can screen across
 companies with plain SQL against ClickHouse.
 
-> **Status:** early development. Runnable skeleton + ClickHouse store schema, and
-> the single compliant, rate-limited EDGAR client (identity/User-Agent, rate cap,
-> cool-down on throttle). Ingestion lands next.
+> **Status:** feature-complete for v1 — ingest, backfill, catch-up, recovery and
+> the SQL screening surface all work end to end.
 
-## Prerequisites
+## Get started in five commands
 
-- Python **≥ 3.12**
-- [`uv`](https://docs.astral.sh/uv/) (project + dependency management)
-- Docker (for the local ClickHouse container)
-
-## Quickstart
+From a fresh clone to a database you can screen with SQL:
 
 ```bash
-# 1. Install dependencies into a local .venv
-uv sync
-
-# 2. Create your local config from the template (fintin.toml is gitignored)
-cp fintin.toml.example fintin.toml
-
-# 3. Start ClickHouse 26.3 (single node, persistent named volume)
-docker compose up -d
-
-# 4. Verify the app can connect
-uv run fintin check-connection
+uv sync                                          # 1. install into a local .venv
+cp fintin.toml.example fintin.toml               # 2. your config (gitignored)
+$EDITOR fintin.toml                              # 3. put YOUR email in contact_email
+docker compose up -d                             # 4. start ClickHouse
+uv run fintin populate                           # 5. build + fill the store
 ```
 
-`uv run fintin --help` lists all commands. (The `fintin` console script lives in
-the project's virtual environment; invoke it via `uv run fintin ...` unless you
-have activated `.venv`.)
+Then query it:
+
+```sql
+SELECT cik, period_end, revenues, net_income,
+       round(net_income / assets * 100, 1) AS roa_pct
+FROM screening_wide
+WHERE revenues > 100e9 AND period_start < period_end
+ORDER BY revenues DESC;
+```
+
+**Step 3 is not optional.** EDGAR requires a real, identifying contact email in
+the User-Agent; a placeholder is rejected as an "Undeclared Automated Tool" and
+risks a ban, so the client refuses to start until you set one. `fintin.toml` is
+gitignored precisely so your address never lands in this public repo.
+
+Steps 1, 2 and 4 need no email — only the commands that actually reach EDGAR do.
+
+### Populating the whole S&P 500
+
+The shipped config lists a handful of large caps so a fresh checkout works
+immediately. For the full index, fetch the current constituents first:
+
+```bash
+uv run fintin universe --refresh-sp500 --write   # rewrite [universe] (backs up first)
+uv run fintin populate                           # then fill the store
+```
+
+That fetch is a single **non-EDGAR** HTTP GET — the SEC doesn't publish index
+membership — so it needs no contact email and spends none of your EDGAR request
+budget. It writes ~503 tickers (dual share classes included); any symbol the
+bundled reference table can't resolve offline is carried through as an explicit
+CIK from the source, so the Universe ends up complete rather than accruing gaps.
+Drop `--write` to print the block and paste it yourself.
+
+Prerequisites: Python **≥ 3.12**, [`uv`](https://docs.astral.sh/uv/), and Docker.
+`uv run fintin --help` lists every command. (The `fintin` script lives in the
+project venv — use `uv run fintin ...` unless you've activated `.venv`.)
+
+If anything goes wrong, start here:
+
+```bash
+uv run fintin check-connection   # can the app reach ClickHouse with this config?
+uv run fintin status             # how much of the Universe is actually in the store?
+uv run fintin --debug <command>  # full traceback for an unexpected error
+```
+
+Every command renders failures as a single clear line rather than a stack trace;
+`--debug` (or `FINTIN_DEBUG=1`) recovers the traceback when you need it. Note it
+is a group-level flag: `fintin --debug backfill`, not `fintin backfill --debug`.
+
+## Starting over
+
+```bash
+uv run fintin reset --yes              # drop every fin-tin object
+uv run fintin reset --yes --recreate   # ...and leave an empty schema ready
+```
+
+`reset` refuses without `--yes`, naming the database and objects it would drop.
+It touches **only** fin-tin's own objects in the configured database, so anything
+else in that ClickHouse instance survives — unlike `docker compose down -v`, which
+discards the entire volume (still the right hammer if the container itself is
+wedged). Wiping is cheap because the corpus is re-derivable by definition: every
+row comes from EDGAR, so `fintin populate` rebuilds it.
 
 ## Pipeline
 
 Data is derived one way — EDGAR → **Tier 0** (raw) → **Tier 1** (canonical) →
-resolution → **wide screening mart**:
+**wide screening mart**. `populate` runs the whole thing, but each stage is also a
+command you can drive directly:
 
 ```bash
-# 1. Create the store schema (idempotent; also refreshes the mart view)
+# Create the store schema (idempotent; also refreshes the mart views)
 uv run fintin schema-init
 
-# 2. Land one company's raw facts into Tier 0 (hits EDGAR — needs a real
-#    contact_email in fintin.toml; rate-limited & fair-access compliant)
+# Fill it: every in-scope company's full history, Tier 0 AND Tier 1
+uv run fintin backfill
+
+# Or work one company at a time — land its raw facts into Tier 0...
 uv run fintin ingest-company 320193
 
-# 3. Project Tier 0 → canonical Tier 1. canonical_concept = the standard XBRL
-#    element itself (e.g. Assets, RevenueFromContractWithCustomerExcludingAssessedTax),
-#    a 1:1 lossless projection. OFFLINE — no EDGAR, so it needs no contact email.
+# ...then project Tier 0 → canonical Tier 1. canonical_concept = the standard XBRL
+# element itself (e.g. Assets, RevenueFromContractWithCustomerExcludingAssessedTax),
+# a 1:1 lossless projection. OFFLINE — no EDGAR, so it needs no contact email.
 uv run fintin map-canonical 320193
 ```
+
+`backfill` and `catch-up` derive Tier 1 for each company as they ingest it, so the
+screening views are populated the moment they finish. The single-company
+`ingest-company` deliberately does not — it's the one place you can inspect raw
+Tier 0 before projecting, which is why `map-canonical` is a separate step there.
 
 Every standard-taxonomy fact projects 1:1 to Tier 1 (the concept is exact and
 unambiguous — the FASB element itself, not a statistical standardization). Re-running
@@ -75,14 +132,18 @@ from authoritative periodic reports (10-K/10-Q). The concept→elements lists li
   Because income facts are durations and balance-sheet facts are instants, they land in
   *separate* rows here — use `screening_wide` when combining the two.
 
-```sql
--- companies with annual revenue over $100B, with ROA (a flow ÷ a stock)
-SELECT cik, period_end, revenues, net_income,
-       round(net_income / assets * 100, 1) AS roa_pct
-FROM screening_wide
-WHERE revenues > 100e9 AND period_start < period_end
-ORDER BY revenues DESC;
+Point any ClickHouse client at the database and query — there is no fin-tin query
+command, because plain SQL is the interface:
+
+```bash
+# the container ships a SQL shell
+docker compose exec clickhouse clickhouse-client --password fintin_local \
+  --query "SELECT cik, period_end, revenues FROM screening_wide ORDER BY revenues DESC LIMIT 5"
 ```
+
+`period_start < period_end` filters to annual/quarterly *flows*; instants (balance
+sheet) carry `period_start = period_end`. See the ROA screen at the top of this
+README for a query mixing the two.
 
 > **Note:** `schema-init` is create-only for tables, but the mart/`screening_wide` views
 > are `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up view changes
@@ -100,7 +161,7 @@ cp fintin.toml.example fintin.toml
 
 - **`[clickhouse]`** — connection block; already matches `docker-compose.yml`, so
   it works out of the box.
-- **`[edgar]`** — EDGAR fair-access settings (needed once ingestion arrives).
+- **`[edgar]`** — EDGAR fair-access settings.
   EDGAR **requires** a real, identifying contact email in the User-Agent, so set
   `contact_email` to **your real address** before running any EDGAR command. The
   EDGAR client refuses to start on a blank/placeholder email (it would otherwise
@@ -110,7 +171,8 @@ cp fintin.toml.example fintin.toml
   *longer* `Retry-After` if the SEC sent one, never a shorter one — then retries.
 - **`[universe]`** — the screening Universe: a static list of `tickers` and/or
   `ciks` (the S&P 500 in v1). Tickers and CIKs are **public data** (safe to keep
-  in the tracked example), unlike your contact email.
+  in the tracked example), unlike your contact email. Optional
+  `constituents_url` overrides where `--refresh-sp500` fetches from.
 - **`[reconcile]`** — work-list tuning. `lookback_days` (default 7) sizes the
   reordering-safe scan window `[high-water-mark − lookback, today]` — how far
   back to re-check EDGAR's index for stragglers and restatements.
@@ -124,8 +186,10 @@ List the companies you want to screen under `[universe]`, then resolve and
 inspect the scope:
 
 ```bash
-uv run fintin universe            # resolve & report scope + any gaps
-uv run fintin universe --show-ciks   # also print the resolved CIK list
+uv run fintin universe                        # resolve & report scope + any gaps
+uv run fintin universe --show-ciks            # also print the resolved CIK list
+uv run fintin universe --refresh-sp500        # print a full S&P 500 [universe] block
+uv run fintin universe --refresh-sp500 --write  # ...and write it to fintin.toml
 ```
 
 Tickers resolve to CIKs **offline** via edgartools' bundled reference table — no
@@ -134,6 +198,14 @@ reported as an **explained gap** (never silently dropped); resolve it by adding
 its numeric `cik` directly. The Universe is derived from config on every run
 (never stored), so **growing it is a config edit alone** — no code or schema
 change.
+
+`--refresh-sp500` fills that list for you from a public constituents CSV (a
+non-EDGAR GET; the SEC doesn't publish index membership). Symbols the bundled
+table can't resolve are carried through as explicit `ciks` from the source, so you
+get the whole index rather than a list with gaps in it. `--write` replaces the
+`[universe]` section and saves the previous config to `fintin.toml.bak` first —
+**comments inside that section are replaced along with it**, and the `.bak` (which
+contains your email) is gitignored.
 
 ### Preview outstanding work
 
@@ -160,25 +232,32 @@ Once your Universe is defined (and after `schema-init`), populate the store with
 each company's full available history:
 
 ```bash
-uv run fintin schema-init            # once — creates Tier 0/1, the MV, and the mart
+uv run fintin schema-init            # once — creates Tier 0/1 and the screening views
 uv run fintin backfill               # ingest every in-scope company's full history
 uv run fintin backfill --show-gaps   # also list any companies recorded as explained gaps
 uv run fintin backfill --refresh     # re-ingest even companies already present (supersedes on read)
 ```
+
+(`fintin populate` is these first two in one command.)
 
 Backfill fetches each company's entire history in **one `companyfacts` request**
 (the request-minimizing per-company strategy), through the same rate-limited
 client, and **commits per company**. It **hits EDGAR and needs a real contact
 email**.
 
-- **Resumable, no checkpoint file.** Companies that already hold facts in the
-  store are skipped (without even re-fetching), so an interrupted backfill just
-  re-run resumes where it left off — resumption is re-derived from the store each
-  run, never from a saved cursor. Re-running is therefore a no-op for companies
-  that landed facts; a company that returned *no* facts is re-checked each run (a
-  bounded cost that also lets a newly-filing company get picked up). `--refresh`
-  re-ingests everything, superseding prior values on read — note the insert-only
-  model supersedes still-present facts but cannot retract one removed since.
+- **Leaves the store queryable, not just landed.** Each company's canonical Tier 1
+  is derived immediately after its Tier 0 commit, so the screening views are
+  populated when the run finishes — no separate mapping pass.
+- **Resumable, no checkpoint file.** Companies already complete are skipped
+  (without even re-fetching), so an interrupted backfill just re-run resumes where
+  it left off — resumption is re-derived from the store each run, never from a
+  saved cursor. "Complete" means present in **both** tiers: if a company's Tier 0
+  landed but its projection failed, it is *not* treated as done, and the next run
+  finishes the job rather than skipping it forever. A company that returned *no*
+  facts is re-checked each run (a bounded cost that also lets a newly-filing
+  company get picked up). `--refresh` re-ingests everything, superseding prior
+  values on read — note the insert-only model supersedes still-present facts but
+  cannot retract one removed since.
 - **Failures are explained gaps, not crashes.** A company with no facts or a fetch
   error is recorded `(cik, reason)` and the run continues to the next company — no
   silent omissions (`--show-gaps` lists them; the coverage report surfaces them).
@@ -207,7 +286,9 @@ will fetch): EDGAR's multi-filer index over the lookback window, minus the
 accessions already in the store. It then re-ingests the **affected companies'** full
 `companyfacts` through the same rate-limited client — so a newly-filed report, and
 any **restatement** of an older period, lands and wins on read (latest-filed-wins).
-Like backfill it **hits EDGAR and needs a real contact email**.
+Like backfill it re-derives each affected company's Tier 1 as it goes, so the new
+or restated numbers are queryable the moment the run finishes, and it **hits EDGAR
+and needs a real contact email**.
 
 - **Success vocabulary, all exit-0.** A non-empty run reports `STARTED`→`COMPLETED`;
   an already-current store reports `NOTHING_TO_DO` (and makes no `companyfacts`

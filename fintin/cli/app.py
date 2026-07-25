@@ -176,6 +176,56 @@ def schema_init_command(
     )
 
 
+@app.command("populate")
+def populate_command(
+    config: Path = typer.Option(
+        Path("fintin.toml"),
+        "--config",
+        "-c",
+        help="Path to the fintin.toml config file.",
+    ),
+    refresh: bool = typer.Option(
+        False,
+        "--refresh",
+        help="Re-ingest companies already in the store (supersedes on read).",
+    ),
+    show_gaps: bool = typer.Option(
+        False,
+        "--show-gaps",
+        help="List every company recorded as an explained gap.",
+    ),
+) -> None:
+    """Take an empty store to a queryable one: schema-init, then backfill.
+
+    The one command a fresh checkout needs. Equivalent to running `schema-init`
+    followed by `backfill` — backfill derives canonical Tier 1 per company as it
+    goes, so the screening views are populated when this finishes. Resumable: an
+    interrupted run just needs re-running (companies already complete are
+    skipped). Hits EDGAR, so it needs a real contact_email."""
+    _configure_logging()
+
+    # Calls the command functions directly rather than re-implementing either.
+    # EVERY parameter must be passed explicitly: an omitted one would arrive as
+    # typer's `OptionInfo` sentinel rather than its default, so
+    # `test_populate_passes_every_parameter_of_its_callees` guards against a
+    # callee growing an option this forgets.
+    typer.secho("[1/2] Creating the store schema...", fg=typer.colors.BLUE)
+    schema_init_command(config=config)
+
+    typer.secho(
+        "\n[2/2] Backfilling the Universe (this hits EDGAR and can take a while)...",
+        fg=typer.colors.BLUE,
+    )
+    backfill_command(config=config, refresh=refresh, show_gaps=show_gaps)
+
+    typer.secho(
+        "\nStore populated. Query it with `screening_wide` / `screening_mart`, "
+        "check coverage with `fintin status`, and keep it current with "
+        "`fintin catch-up`.",
+        fg=typer.colors.GREEN,
+    )
+
+
 @app.command("reset")
 def reset_command(
     config: Path = typer.Option(

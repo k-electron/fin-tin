@@ -1049,6 +1049,84 @@ def test_status_fully_covered_has_no_gap_line(tmp_path, status_db, local_clickho
     assert "Traceback" not in res.output
 
 
+# --- populate (the one-shot: schema-init + backfill) ----------------------------
+
+
+def test_populate_runs_schema_init_then_backfill(tmp_path, monkeypatch):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    order: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        app_mod,
+        "schema_init_command",
+        lambda **kw: order.append(("schema-init", kw)),
+    )
+    monkeypatch.setattr(
+        app_mod, "backfill_command", lambda **kw: order.append(("backfill", kw))
+    )
+
+    result = runner.invoke(app, ["populate", "--config", str(p)])
+
+    assert result.exit_code == 0
+    assert [step for step, _ in order] == ["schema-init", "backfill"]  # order matters
+    assert order[1][1] == {"config": p, "refresh": False, "show_gaps": False}
+    assert "screening_wide" in result.output  # tells you how to query it
+
+
+def test_populate_forwards_its_flags(tmp_path, monkeypatch):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    seen: dict = {}
+    monkeypatch.setattr(app_mod, "schema_init_command", lambda **kw: None)
+    monkeypatch.setattr(app_mod, "backfill_command", lambda **kw: seen.update(kw))
+
+    runner.invoke(
+        app, ["populate", "--config", str(p), "--refresh", "--show-gaps"]
+    )
+    assert seen == {"config": p, "refresh": True, "show_gaps": True}
+
+
+def test_populate_stops_if_schema_init_fails(tmp_path, monkeypatch):
+    """A failed schema-init must not be followed by a backfill that would spend
+    EDGAR requests it cannot persist."""
+    import typer as _typer
+
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    called: list[str] = []
+
+    def _fail(**kw):
+        raise _typer.Exit(code=1)
+
+    monkeypatch.setattr(app_mod, "schema_init_command", _fail)
+    monkeypatch.setattr(app_mod, "backfill_command", lambda **kw: called.append("b"))
+
+    result = runner.invoke(app, ["populate", "--config", str(p)])
+    assert result.exit_code == 1
+    assert called == [], "backfill ran after schema-init failed"
+
+
+def test_populate_passes_every_parameter_of_its_callees():
+    """populate calls the command functions directly, so an omitted parameter
+    would silently become typer's OptionInfo sentinel instead of its default.
+    If a callee grows an option, this fails until populate forwards it."""
+    import inspect
+
+    source = inspect.getsource(app_mod.populate_command)
+    for callee in (app_mod.schema_init_command, app_mod.backfill_command):
+        for param in inspect.signature(callee).parameters:
+            assert f"{param}=" in source, (
+                f"populate_command does not pass {callee.__name__}'s "
+                f"'{param}' parameter"
+            )
+
+
+def test_help_lists_populate():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "populate" in result.output
+
+
 # --- universe --refresh-sp500 (fetch is faked; no network in the suite) ---------
 
 _SP500_CSV = (
