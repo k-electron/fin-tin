@@ -92,3 +92,20 @@ def present_accessions(client, *, accessions: Collection[str]) -> set[str]:
         parameters={"accessions": acc_list},
     )
     return {row[0] for row in result.result_rows}
+
+
+def present_ciks(client, *, ciks: Collection[int]) -> set[int]:
+    """Of the given ``ciks``, the subset already present in ``raw_fact`` (≥ 1 row) —
+    the per-company AD-16 membership check that makes backfill resumable without a
+    checkpoint (AD-1/AD-11). A per-company ingest is a single atomic insert, so a
+    present CIK is fully committed; the backfill engine skips these to avoid a
+    re-fetch on restart (SM-C1). Parameterized (never string-interpolated). Empty
+    input → ``set()`` with no query. No ``FINAL``: membership is existence."""
+    cik_list = [int(c) for c in ciks]
+    if not cik_list:
+        return set()
+    result = client.query(
+        "SELECT DISTINCT cik FROM raw_fact WHERE cik IN %(ciks)s",
+        parameters={"ciks": cik_list},
+    )
+    return {int(row[0]) for row in result.result_rows}

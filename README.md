@@ -151,8 +151,40 @@ window spans — not per-company crawling), so it **hits EDGAR and needs a real
 contact email** (like ingestion). Per-accession **membership** against the store
 is the authority (already-present filings are excluded; a newly-filed amendment
 restating an old period shows up); the high-water mark only sizes the scan
-window. It's a **read-only dry-run** — it ingests nothing (backfill/catch-up land
-in later stories).
+window. It's a **read-only dry-run** — it ingests nothing (catch-up lands in a
+later stage).
+
+### Backfill the Universe
+
+Once your Universe is defined (and after `schema-init`), populate the store with
+each company's full available history:
+
+```bash
+uv run fintin schema-init            # once — creates Tier 0/1, the MV, and the mart
+uv run fintin backfill               # ingest every in-scope company's full history
+uv run fintin backfill --show-gaps   # also list any companies recorded as explained gaps
+uv run fintin backfill --refresh     # re-ingest even companies already present (idempotent)
+```
+
+Backfill fetches each company's entire history in **one `companyfacts` request**
+(the request-minimizing per-company strategy), through the same rate-limited
+client, and **commits per company**. It **hits EDGAR and needs a real contact
+email**.
+
+- **Resumable, no checkpoint file.** Companies already in the store are skipped
+  (without even re-fetching), so an interrupted backfill just re-run resumes where
+  it left off — resumption is re-derived from the store each run, never from a
+  saved cursor. Re-running a finished backfill is a no-op.
+- **Failures are explained gaps, not crashes.** A company with no facts or a fetch
+  error is recorded `(cik, reason)` and the run continues to the next company — no
+  silent omissions (`--show-gaps` lists them; the coverage report surfaces them).
+- **Throttle aborts, by design.** If EDGAR throttles and the client exhausts its
+  cool-down retries, the run stops rather than continuing to hammer EDGAR —
+  ban-safety always outranks finishing faster.
+
+The backfill strategy is pluggable: the per-company `companyfacts` API is the v1
+strategy; a bulk-download strategy for a much larger Universe can drop in behind
+the same interface with no redesign.
 
 ## Testing
 

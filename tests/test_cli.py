@@ -224,3 +224,50 @@ def test_work_list_placeholder_email_reports_clean_error(tmp_path):
     assert result.exit_code == 2
     assert "EDGAR config error" in result.output
     assert "Traceback" not in result.output
+
+
+# --- backfill (Story 2.3) ------------------------------------------------------
+# Error paths only — the happy path hits EDGAR's companyfacts API (covered offline
+# by test_backfill / test_edgar_backfill / test_raw_fact_repo), never live in tests.
+
+
+def test_help_lists_backfill():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "backfill" in result.output
+
+
+def test_backfill_missing_config_reports_clean_error():
+    result = runner.invoke(app, ["backfill", "--config", "does-not-exist.toml"])
+    assert result.exit_code == 2
+    assert "Config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_backfill_missing_universe_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY)  # no [universe]
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "[universe]" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_backfill_missing_edgar_reports_clean_error(tmp_path):
+    # [universe] present but no [edgar] — the EdgarClient gate must fail loudly
+    # (exit 2) BEFORE any EDGAR/ClickHouse access (offline, ban-safe).
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n')
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_backfill_placeholder_email_reports_clean_error(tmp_path):
+    p = tmp_path / "fintin.toml"
+    p.write_text(_CH_ONLY + '\n[universe]\ntickers = ["AAPL"]\n' + _EDGAR_PLACEHOLDER)
+    result = runner.invoke(app, ["backfill", "--config", str(p)])
+    assert result.exit_code == 2
+    assert "EDGAR config error" in result.output
+    assert "Traceback" not in result.output

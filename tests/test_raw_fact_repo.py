@@ -21,6 +21,7 @@ from fintin.adapters.store.raw_fact_repo import (
     insert_raw_facts,
     next_ingest_version,
     present_accessions,
+    present_ciks,
 )
 from fintin.core.ingest import RawFactRow, to_raw_fact_rows
 
@@ -229,3 +230,27 @@ def test_present_accessions_returns_present_subset(schema_client):
 def test_present_accessions_empty_is_empty_no_query(schema_client):
     insert_raw_facts(schema_client, [_row(content_hash="a")])
     assert present_accessions(schema_client, accessions=[]) == set()
+
+
+# --- present_ciks: per-company membership for resumable backfill (Story 2.3) ----
+
+
+@pytest.mark.integration
+def test_present_ciks_returns_present_subset(schema_client):
+    # Per-company membership (AD-16): a CIK with ≥1 row is "present" (done).
+    insert_raw_facts(
+        schema_client,
+        [
+            _row(cik=320193, accession="0000320193-24-000001", content_hash="a"),
+            _row(cik=789019, accession="0000789019-24-000002", content_hash="b"),
+        ],
+    )
+    # Query a scope of three: two present, one absent.
+    present = present_ciks(schema_client, ciks={320193, 789019, 111111})
+    assert present == {320193, 789019}  # the absent CIK is excluded
+
+
+@pytest.mark.integration
+def test_present_ciks_empty_is_empty_no_query(schema_client):
+    insert_raw_facts(schema_client, [_row(content_hash="a")])
+    assert present_ciks(schema_client, ciks=[]) == set()

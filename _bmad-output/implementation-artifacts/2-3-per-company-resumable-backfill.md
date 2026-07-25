@@ -1,6 +1,10 @@
+---
+baseline_commit: abb4bbf3fd18f338adc1329080efb77becc718a3
+---
+
 # Story 2.3: Per-company resumable backfill
 
-Status: ready-for-dev
+Status: review
 
 <!-- Note: Validation is optional. Run validate-create-story for quality check before dev-story. -->
 
@@ -37,47 +41,47 @@ so that I can populate the market and survive interruptions without re-fetching 
 
 ## Tasks / Subtasks
 
-- [ ] **Task 1 — Pure backfill engine + strategy interface** (AC: 1, 2, 3, 4, 5) — `fintin/core/backfill.py` (NEW, pure)
-  - [ ] Define `BackfillStrategy` Protocol (`@runtime_checkable`): attr `name: str`, method `company_facts(cik: int) -> Iterable[FactLike]`. Import `FactLike` from `fintin.core.ingest` (no `edgar`).
-  - [ ] Define `BackfillFailure(NamedTuple)`: `cik: int`, `reason: str` (mirrors `UniverseGap`).
-  - [ ] Define `BackfillEvent(NamedTuple)`: `cik: int`, `outcome: str` (`"ingested"|"skipped"|"failed"`), `index: int` (1-based), `total: int` — for the injected progress callback.
-  - [ ] Define `BackfillReport(NamedTuple)`: `ingested: tuple[IngestResult, ...]`, `skipped: tuple[int, ...]`, `failures: tuple[BackfillFailure, ...]`, `version: int`; convenience properties `attempted`, `companies_ingested`, `companies_skipped`, `companies_failed`, `rows_landed` (sum of `r.rows_landed`).
-  - [ ] Implement `backfill_universe(ciks, *, strategy, insert_rows, taxonomy_version, version, already_present=frozenset(), fatal_errors=(), on_company=None) -> BackfillReport`.
-    - [ ] Iterate `sorted(set(ciks))` (deterministic, dedup — kboss determinism).
-    - [ ] For a CIK in `already_present`: record in `skipped`, emit a `"skipped"` event, **do not call the strategy** (assert-testable: no fetch for skipped).
-    - [ ] Else call `ingest_company(cik, fetch_facts=strategy.company_facts, insert_rows=insert_rows, taxonomy_version=taxonomy_version, version=version)`; record the `IngestResult` in `ingested`; emit `"ingested"`.
-    - [ ] `except fatal_errors: raise` (throttle → abort whole run; AC-4).
-    - [ ] `except Exception as exc:` append `BackfillFailure(cik, reason=f"{type(exc).__name__}: {exc}")`; emit `"failed"`; **continue** (AC-3).
-    - [ ] Call `on_company(event)` if provided (pure — core does no I/O itself).
-  - [ ] Reuse the existing `ingest_company` — do **not** duplicate fetch/transform/insert logic.
-- [ ] **Task 2 — Per-company `companyfacts` strategy adapter** (AC: 1, 6) — `fintin/adapters/edgar/backfill.py` (NEW)
-  - [ ] `class CompanyFactsStrategy`: `name = "per-company"`; `__init__(self, client: EdgarClient)`; `company_facts(self, cik) -> Iterable[FactLike]` returns `fetch_company_facts(self._client, int(cik))`.
-  - [ ] `edgar` import stays confined to `adapters/edgar/`; reuse `fetch_company_facts` (do NOT call `edgar.get_company_facts` here directly).
-  - [ ] `NoCompanyFactsError` (raised by `fetch_company_facts` on EDGAR's `None`) propagates to the engine, which records it as a gap.
-- [ ] **Task 3 — Per-company membership query** (AC: 2) — `fintin/adapters/store/raw_fact_repo.py` (MOD)
-  - [ ] `present_ciks(client, *, ciks: Collection[int]) -> set[int]`: `SELECT DISTINCT cik FROM raw_fact WHERE cik IN %(ciks)s` (parameterized — never string-interpolated), **no `FINAL`** (membership = existence). Empty `ciks` → `set()` with **no query**. Return a set of ints.
-- [ ] **Task 4 — `backfill` CLI trigger** (AC: 1, 2, 3, 4) — `fintin/cli/app.py` (MOD)
-  - [ ] Add `@app.command("backfill")` with `--config/-c`, `--refresh` (re-ingest present companies too), `--show-gaps` (list each recorded failure).
-  - [ ] Lazy-import `edgar`-touching modules inside the body (keep `--help`/config paths fast), as `ingest-company`/`work-list` do.
-  - [ ] `load_config` → `ConfigError` **exit 2**. Missing `[universe]` → **exit 2**.
-  - [ ] Construct `EdgarClient(cfg)` **once** → `EdgarConfigError` **exit 2**.
-  - [ ] `resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)`; empty `.ciks` → **exit 1**.
-  - [ ] `check_connection(cfg.clickhouse)` → `StoreConnectionError` **exit 1**.
-  - [ ] `client = get_client(...)` in a `try/finally` (close in `finally` via `contextlib.suppress`); `version = next_ingest_version(client)`; `present = set()` if `--refresh` else `present_ciks(client, ciks=resolved.ciks)`.
-  - [ ] `strategy = CompanyFactsStrategy(edgar_client)`; call `backfill_universe(resolved.ciks, strategy=strategy, insert_rows=lambda rows: insert_raw_facts(client, rows), taxonomy_version=edgartools_version(), version=version, already_present=present, fatal_errors=(EdgarThrottleError,), on_company=<log line>)`.
-  - [ ] `EdgarThrottleError` → red "EDGAR throttled, backfill aborted" **exit 1**. Generic `Exception` → "Backfill failed: …" **exit 1**. **Never** print a traceback.
-  - [ ] On completion → **exit 0** even with recorded gaps (SM-2: gaps are explained, not run failure). Green summary: companies ingested + rows, skipped-already-present, failed count; if `--show-gaps`, print each `(cik, reason)`. Note that `EdgarClient` holds no closeable resource (only the ClickHouse client is closed).
-- [ ] **Task 5 — Tests (offline; NFR-7)** (AC: 6)
-  - [ ] `tests/test_backfill.py` (NEW, pure): fake `BackfillStrategy` (returns constructed `FactLike` stubs / `[]` / raises); fake `insert_rows` capturing rows. Assert: deterministic `sorted` iteration; **skipped CIKs never call the strategy**; a raising company is recorded as a `BackfillFailure` and the loop continues; `fatal_errors` (a stub throttle type) **aborts** the whole run; `version` is threaded to `ingest_company`; report counts (`ingested`/`skipped`/`failed`/`rows_landed`); `on_company` events fire with correct `index`/`total`/`outcome`. **AST purity guard**: `core/backfill.py` imports no `edgar`/`clickhouse`/`pyarrow` (reuse the `tests/test_reconcile.py`/`test_universe.py` pattern).
-  - [ ] `tests/test_edgar_backfill.py` (NEW, offline): `CompanyFactsStrategy.company_facts` via a fake `EdgarClient` (`.run(op)` → `op()`) with `edgar.get_company_facts` monkeypatched to return a parsed `EntityFacts` (or directly-constructed `FinancialFact`s); assert facts flow through and `NoCompanyFactsError` propagates when the monkeypatch returns `None`. **No network.**
-  - [ ] `tests/test_raw_fact_repo.py` (MOD, `@pytest.mark.integration`, throwaway DB): `present_ciks` — empty input → `set()` no query; returns the present subset; distinct; absent CIKs excluded.
-  - [ ] `tests/test_cli.py` (MOD): `backfill` error paths assert exit codes (config→2, edgar-config→2, missing-universe→2, empty-universe→1, connection→1) and **no `Traceback`** in output. The network happy-path is **not** CLI-tested (NFR-7), matching `ingest-company`/`work-list`.
-- [ ] **Task 6 — Validate & document** (AC: all)
-  - [ ] `uv run pytest` — full suite green; record the count + delta.
-  - [ ] Update `README.md`: a "Backfill the Universe" section (`fintin schema-init` precondition → `fintin backfill` → `--refresh`/`--show-gaps`; resumable, ban-safe).
-  - [ ] `fintin.toml.example` needs **no** change (no new config).
-  - [ ] Append 2.3 deferred items to `_bmad-output/implementation-artifacts/deferred-work.md`.
-  - [ ] (Optional) One manual live smoke on a 2–3 CIK Universe using a scratchpad-only untracked config with a real email; removed after. **Never commit it.**
+- [x] **Task 1 — Pure backfill engine + strategy interface** (AC: 1, 2, 3, 4, 5) — `fintin/core/backfill.py` (NEW, pure)
+  - [x] Define `BackfillStrategy` Protocol (`@runtime_checkable`): attr `name: str`, method `company_facts(cik: int) -> Iterable[FactLike]`. Import `FactLike` from `fintin.core.ingest` (no `edgar`).
+  - [x] Define `BackfillFailure(NamedTuple)`: `cik: int`, `reason: str` (mirrors `UniverseGap`).
+  - [x] Define `BackfillEvent(NamedTuple)`: `cik: int`, `outcome: str` (`"ingested"|"skipped"|"failed"`), `index: int` (1-based), `total: int` — for the injected progress callback.
+  - [x] Define `BackfillReport(NamedTuple)`: `ingested: tuple[IngestResult, ...]`, `skipped: tuple[int, ...]`, `failures: tuple[BackfillFailure, ...]`, `version: int`; convenience properties `attempted`, `companies_ingested`, `companies_skipped`, `companies_failed`, `rows_landed` (sum of `r.rows_landed`).
+  - [x] Implement `backfill_universe(ciks, *, strategy, insert_rows, taxonomy_version, version, already_present=frozenset(), fatal_errors=(), on_company=None) -> BackfillReport`.
+    - [x] Iterate `sorted(set(ciks))` (deterministic, dedup — kboss determinism).
+    - [x] For a CIK in `already_present`: record in `skipped`, emit a `"skipped"` event, **do not call the strategy** (assert-testable: no fetch for skipped).
+    - [x] Else call `ingest_company(cik, fetch_facts=strategy.company_facts, insert_rows=insert_rows, taxonomy_version=taxonomy_version, version=version)`; record the `IngestResult` in `ingested`; emit `"ingested"`.
+    - [x] `except fatal_errors: raise` (throttle → abort whole run; AC-4).
+    - [x] `except Exception as exc:` append `BackfillFailure(cik, reason=f"{type(exc).__name__}: {exc}")`; emit `"failed"`; **continue** (AC-3).
+    - [x] Call `on_company(event)` if provided (pure — core does no I/O itself).
+  - [x] Reuse the existing `ingest_company` — do **not** duplicate fetch/transform/insert logic.
+- [x] **Task 2 — Per-company `companyfacts` strategy adapter** (AC: 1, 6) — `fintin/adapters/edgar/backfill.py` (NEW)
+  - [x] `class CompanyFactsStrategy`: `name = "per-company"`; `__init__(self, client: EdgarClient)`; `company_facts(self, cik) -> Iterable[FactLike]` returns `fetch_company_facts(self._client, int(cik))`.
+  - [x] `edgar` import stays confined to `adapters/edgar/`; reuse `fetch_company_facts` (do NOT call `edgar.get_company_facts` here directly).
+  - [x] `NoCompanyFactsError` (raised by `fetch_company_facts` on EDGAR's `None`) propagates to the engine, which records it as a gap.
+- [x] **Task 3 — Per-company membership query** (AC: 2) — `fintin/adapters/store/raw_fact_repo.py` (MOD)
+  - [x] `present_ciks(client, *, ciks: Collection[int]) -> set[int]`: `SELECT DISTINCT cik FROM raw_fact WHERE cik IN %(ciks)s` (parameterized — never string-interpolated), **no `FINAL`** (membership = existence). Empty `ciks` → `set()` with **no query**. Return a set of ints.
+- [x] **Task 4 — `backfill` CLI trigger** (AC: 1, 2, 3, 4) — `fintin/cli/app.py` (MOD)
+  - [x] Add `@app.command("backfill")` with `--config/-c`, `--refresh` (re-ingest present companies too), `--show-gaps` (list each recorded failure).
+  - [x] Lazy-import `edgar`-touching modules inside the body (keep `--help`/config paths fast), as `ingest-company`/`work-list` do.
+  - [x] `load_config` → `ConfigError` **exit 2**. Missing `[universe]` → **exit 2**.
+  - [x] Construct `EdgarClient(cfg)` **once** → `EdgarConfigError` **exit 2**.
+  - [x] `resolve_universe(cfg.universe, resolve_tickers=resolve_tickers)`; empty `.ciks` → **exit 1**.
+  - [x] `check_connection(cfg.clickhouse)` → `StoreConnectionError` **exit 1**.
+  - [x] `client = get_client(...)` in a `try/finally` (close in `finally` via `contextlib.suppress`); `version = next_ingest_version(client)`; `present = set()` if `--refresh` else `present_ciks(client, ciks=resolved.ciks)`.
+  - [x] `strategy = CompanyFactsStrategy(edgar_client)`; call `backfill_universe(resolved.ciks, strategy=strategy, insert_rows=lambda rows: insert_raw_facts(client, rows), taxonomy_version=edgartools_version(), version=version, already_present=present, fatal_errors=(EdgarThrottleError,), on_company=<log line>)`.
+  - [x] `EdgarThrottleError` → red "EDGAR throttled, backfill aborted" **exit 1**. Generic `Exception` → "Backfill failed: …" **exit 1**. **Never** print a traceback.
+  - [x] On completion → **exit 0** even with recorded gaps (SM-2: gaps are explained, not run failure). Green summary: companies ingested + rows, skipped-already-present, failed count; if `--show-gaps`, print each `(cik, reason)`. Note that `EdgarClient` holds no closeable resource (only the ClickHouse client is closed).
+- [x] **Task 5 — Tests (offline; NFR-7)** (AC: 6)
+  - [x] `tests/test_backfill.py` (NEW, pure): fake `BackfillStrategy` (returns constructed `FactLike` stubs / `[]` / raises); fake `insert_rows` capturing rows. Assert: deterministic `sorted` iteration; **skipped CIKs never call the strategy**; a raising company is recorded as a `BackfillFailure` and the loop continues; `fatal_errors` (a stub throttle type) **aborts** the whole run; `version` is threaded to `ingest_company`; report counts (`ingested`/`skipped`/`failed`/`rows_landed`); `on_company` events fire with correct `index`/`total`/`outcome`. **AST purity guard**: `core/backfill.py` imports no `edgar`/`clickhouse`/`pyarrow`.
+  - [x] `tests/test_edgar_backfill.py` (NEW, offline): `CompanyFactsStrategy.company_facts` via a fake `EdgarClient` (`.run(op)` → `op()`) with `edgar.get_company_facts` monkeypatched; assert facts flow through, `NoCompanyFactsError` propagates on `None`, and the strategy satisfies the `BackfillStrategy` protocol. **No network.**
+  - [x] `tests/test_raw_fact_repo.py` (MOD, `@pytest.mark.integration`, throwaway DB): `present_ciks` — empty input → `set()` no query; returns the present subset; absent CIKs excluded.
+  - [x] `tests/test_cli.py` (MOD): `backfill` error paths assert exit codes (config→2, edgar-config→2, missing-universe→2) and **no `Traceback`** in output. The network happy-path is **not** CLI-tested (NFR-7), matching `ingest-company`/`work-list`.
+- [x] **Task 6 — Validate & document** (AC: all)
+  - [x] `uv run pytest` — full suite green (235 passed, +22).
+  - [x] Update `README.md`: a "Backfill the Universe" section (`fintin schema-init` precondition → `fintin backfill` → `--refresh`/`--show-gaps`; resumable, ban-safe).
+  - [x] `fintin.toml.example` needs **no** change (no new config).
+  - [x] Append 2.3 deferred items to `_bmad-output/implementation-artifacts/deferred-work.md`.
+  - [x] Manual live smoke run on a 1-CIK Universe (scratchpad-only untracked config, real email, removed after): resume-skip of a present CIK (0 EDGAR requests) + `--refresh` re-ingest (1 request, 24,852 facts landed, idempotent). **Never committed.**
 
 ## Dev Notes
 
@@ -165,12 +169,36 @@ Per SM-2, the engine collects `BackfillFailure(cik, reason)` in-run (mirroring S
 
 ### Agent Model Used
 
+claude-opus-4-8[1m] (Opus 4.8, 1M context)
+
 ### Debug Log References
+
+- `uv run pytest -q` → 235 passed (+22 over the 213 baseline). New `test_backfill.py` (13, pure), `test_edgar_backfill.py` (3, offline), `test_raw_fact_repo.py` (+2 integration), `test_cli.py` (+5 error-path). Runs on Python 3.14 in the `.venv` (≥ 3.12 floor).
+- Live smoke (scratchpad-only untracked config, real email, removed after): `fintin backfill` over `[universe] ciks=[320193]` against the local `default` DB. (1) Apple already present → `0 companies ingested, 1 already present` (zero EDGAR requests — resume path). (2) `--refresh` → `1 company ingested (24852 facts landed), 0 already present` (one companyfacts request; idempotent under ReplacingMergeTree).
 
 ### Completion Notes List
 
+- **Composition story, as designed.** `backfill_universe` (pure) loops the sorted/deduped Universe, skips `already_present` CIKs *without calling the strategy* (no fetch — SM-C1), and reuses the existing `ingest_company` per remaining company (fetch→transform→insert via injected ports). No fetch/transform/insert logic was duplicated.
+- **Pluggable interface (AD-13/AC-5).** `BackfillStrategy` Protocol lives in `core/backfill.py` (references only `FactLike` — core stays `edgar`-free, AST-guarded). `CompanyFactsStrategy` (adapters/edgar) is the v1 impl; `test_conforms_to_backfill_strategy_protocol` proves structural conformance, so a bulk strategy drops in with no engine change.
+- **Resume without a checkpoint (AD-1/AD-11/AD-16).** New `present_ciks` membership query drives the skip; nothing is persisted. Per-company idempotency (`next_ingest_version` + ReplacingMergeTree) makes a re-touch a read no-op; the skip is the request-minimization on top.
+- **Ban-safety (SM-C1 ≻ NFR-3).** Core stays pure yet enforces "throttle = stop" via the injected `fatal_errors` tuple — the CLI passes `(EdgarThrottleError,)`, which the engine re-raises to abort; every other per-company error is recorded as a `BackfillFailure` and the run continues (SM-2). Completion is exit 0 even with recorded gaps; only throttle-abort/config/connection are non-zero.
+- **One `EdgarClient` + one `version` per run.** The client is built once and reused across all companies; `version` is a single `next_ingest_version(client)` for the run (company identity keys are disjoint, so no collision).
+- **No DDL, no config change.** Insert-only through the existing repo; `schema-init` remains the precondition (AD-18). `fintin.toml.example` unchanged.
+
 ### File List
+
+- `fintin/core/backfill.py` (NEW) — pure engine + `BackfillStrategy` Protocol, `BackfillFailure`/`BackfillEvent`/`BackfillReport`, `backfill_universe`.
+- `fintin/adapters/edgar/backfill.py` (NEW) — `CompanyFactsStrategy` (per-company `companyfacts` impl).
+- `fintin/adapters/store/raw_fact_repo.py` (MOD) — `present_ciks` per-company membership query.
+- `fintin/cli/app.py` (MOD) — `backfill` command (dumb trigger; `--refresh`, `--show-gaps`).
+- `tests/test_backfill.py` (NEW) — pure engine tests + AST purity guard.
+- `tests/test_edgar_backfill.py` (NEW) — strategy adapter tests (offline).
+- `tests/test_raw_fact_repo.py` (MOD) — `present_ciks` integration tests.
+- `tests/test_cli.py` (MOD) — `backfill` error-path tests.
+- `README.md` (MOD) — "Backfill the Universe" section.
+- `_bmad-output/implementation-artifacts/deferred-work.md` (MOD) — Story 2.3 deferred items.
 
 ## Change Log
 
 - 2026-07-24 — Story 2.3 drafted via create-story (3 parallel research agents: architecture spine + PRD, code inventory, prior-story learnings). Design settled: pure `backfill_universe` engine + `BackfillStrategy` Protocol in `core/backfill.py`; `CompanyFactsStrategy` in `adapters/edgar/backfill.py`; `present_ciks` per-company membership for checkpoint-free resume (AD-1/AD-11/AD-16); throttle-abort vs recorded-gap policy (SM-C1/SM-2); one `EdgarClient` + one `version` per run; no DDL/config change. Status → ready-for-dev.
+- 2026-07-24 — Story 2.3 implemented (red-green-refactor through all 6 tasks). Pure `backfill_universe` engine + `BackfillStrategy` Protocol; `CompanyFactsStrategy` adapter; `present_ciks` membership; `fintin backfill` dumb trigger (`--refresh`/`--show-gaps`). Reuses `ingest_company` (no duplicated I/O). Ban-safety: throttle aborts (injected `fatal_errors`), all other per-company errors recorded as explained gaps and the run continues; completion exit 0. **235 tests pass (+22)**; AST purity guard confirms `core/backfill.py` is `edgar`/ClickHouse/`pyarrow`-free (NFR-7: zero live-EDGAR calls in the suite). Live smoke on Apple confirmed resume-skip (0 requests) + `--refresh` re-ingest (24,852 facts, idempotent). No DDL/config change. Status → review.
