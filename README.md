@@ -37,8 +37,15 @@ gitignored precisely so your address never lands in this public repo.
 Steps 1, 2 and 4 need no email — only the commands that actually reach EDGAR do.
 
 Step 5 fills the store with whatever `[universe]` lists. Out of the box that's a
-15-company sample, so it finishes in seconds; see below for the full S&P 500
-(~7 minutes, ~2 GiB). `populate` is resumable — re-run it after any interruption.
+15-company sample, so it finishes in seconds. `populate` is resumable — re-run it
+after any interruption, and it skips companies already complete.
+
+It runs `schema-init` and then `backfill`, in that order. So if step 3 is wrong and
+the backfill is refused, you are left with an empty schema and no data — harmless,
+and re-running after fixing the email picks up from there.
+
+**If you want the full S&P 500, do the refresh below _before_ step 5** — otherwise
+you populate the 15-company sample first and spend EDGAR requests you don't need.
 
 ### Populating the whole S&P 500
 
@@ -65,10 +72,15 @@ local container:
 
 | | |
 |---|---|
-| Wall clock | **~7 minutes** (one `companyfacts` request per company at 9 req/s) |
+| Wall clock | **roughly 7–11 minutes** (one `companyfacts` request per company at 9 req/s) |
 | Facts landed | **~12.6 million**, mirrored in Tier 0 and Tier 1 |
 | Disk | **~2 GiB** total across both tiers |
 | Coverage | 498 of 500; the rest are genuinely factless (see below) |
+
+The row counts and disk figures are stable — two independent full runs produced
+identical totals. **Wall clock is not:** the same work took ~7 and ~11 minutes on
+back-to-back runs, so EDGAR responsiveness dominates, not your machine. Treat it as
+"minutes, not hours" rather than a number to plan against.
 
 It's resumable, so interrupting costs only the in-flight company.
 
@@ -181,7 +193,7 @@ README for a query mixing the two.
 > **Upgrading a store built before the `Date32` change:** table definitions are
 > *not* migrated, so a database created earlier still has the narrower `Date`
 > columns and will keep failing on filers that use sentinel dates. Rebuild it:
-> `fintin reset --yes --recreate && fintin populate` (~7 minutes for the S&P 500).
+> `fintin reset --yes --recreate && fintin populate` (minutes, for the S&P 500).
 > Nothing is lost — every row is re-derivable from EDGAR.
 
 ## Configuration
