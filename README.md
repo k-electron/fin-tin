@@ -36,6 +36,10 @@ gitignored precisely so your address never lands in this public repo.
 
 Steps 1, 2 and 4 need no email — only the commands that actually reach EDGAR do.
 
+Step 5 fills the store with whatever `[universe]` lists. Out of the box that's a
+15-company sample, so it finishes in seconds; see below for the full S&P 500
+(~7 minutes, ~2 GiB). `populate` is resumable — re-run it after any interruption.
+
 ### Populating the whole S&P 500
 
 The shipped config lists a handful of large caps so a fresh checkout works
@@ -48,10 +52,35 @@ uv run fintin populate                           # then fill the store
 
 That fetch is a single **non-EDGAR** HTTP GET — the SEC doesn't publish index
 membership — so it needs no contact email and spends none of your EDGAR request
-budget. It writes ~503 tickers (dual share classes included); any symbol the
-bundled reference table can't resolve offline is carried through as an explicit
-CIK from the source, so the Universe ends up complete rather than accruing gaps.
-Drop `--write` to print the block and paste it yourself.
+budget. Any symbol the bundled reference table can't resolve offline is carried
+through as an explicit CIK from the source, so the Universe ends up complete
+rather than accruing gaps. Drop `--write` to print the block and paste it
+yourself.
+
+It writes **503 listings, which resolve to 500 companies** — dual share classes
+(GOOGL/GOOG, FOX/FOXA, NWS/NWSA) share one CIK, so the counts differ by design.
+
+**What to expect from a full S&P 500 populate**, measured on a laptop against a
+local container:
+
+| | |
+|---|---|
+| Wall clock | **~7 minutes** (one `companyfacts` request per company at 9 req/s) |
+| Facts landed | **~12.6 million**, mirrored in Tier 0 and Tier 1 |
+| Disk | **~2 GiB** total across both tiers |
+| Coverage | 498 of 500; the rest are genuinely factless (see below) |
+
+It's resumable, so interrupting costs only the in-flight company.
+
+Expect **two or three explained gaps**, and note they are not failures:
+
+- companies that have filed no XBRL yet (recent registrants), and
+- companies whose every fact is filtered out as non-standard-taxonomy.
+
+You may also see a ticker reported as an unresolved gap while its company *is*
+in scope — `fintin universe` flags the symbol the bundled table couldn't resolve,
+but the CIK backstop above already put the company in your Universe. Cross-check
+with `fintin status` before chasing one: it reports what's actually in the store.
 
 Prerequisites: Python **≥ 3.12**, [`uv`](https://docs.astral.sh/uv/), and Docker.
 `uv run fintin --help` lists every command. (The `fintin` script lives in the
@@ -148,6 +177,12 @@ README for a query mixing the two.
 > **Note:** `schema-init` is create-only for tables, but the mart/`screening_wide` views
 > are `CREATE OR REPLACE` — re-run `schema-init` after upgrading to pick up view changes
 > on an existing database.
+>
+> **Upgrading a store built before the `Date32` change:** table definitions are
+> *not* migrated, so a database created earlier still has the narrower `Date`
+> columns and will keep failing on filers that use sentinel dates. Rebuild it:
+> `fintin reset --yes --recreate && fintin populate` (~7 minutes for the S&P 500).
+> Nothing is lost — every row is re-derivable from EDGAR.
 
 ## Configuration
 
