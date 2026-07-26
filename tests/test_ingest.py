@@ -305,3 +305,61 @@ def test_fixture_parse_transform_pins_value_scale():
     by_tag = {r.raw_tag: r for r in rows}
     assert by_tag["us-gaap:Revenues"].value == 123456.0  # actual val, NOT scaled
     assert by_tag["us-gaap:Assets"].period_start == by_tag["us-gaap:Assets"].period_end  # instant
+
+
+# --- out-of-range dates: one bad fact must not cost a whole company --------------
+# Regression for a live failure. Oracle (CIK 1341439) files
+# `RestructuringAndRelatedCostExpectedCost` with the sentinel range
+# 1900-01-01 -> 2199-12-31. A company commits as ONE atomic insert, so that single
+# unstorable date failed the whole company: all 26,035 Oracle facts were lost on
+# the first full-market backfill. It was deferred as "unreachable for real
+# SEC/XBRL data" — it is not.
+
+
+def test_oracles_sentinel_dates_are_stored_not_dropped():
+    """The exact live case. Because the columns are now Date32, Oracle's sentinel
+    range is *storable* — so the fact is kept rather than dropped, and the
+    company's insert no longer fails. Preserving the fact is the better outcome;
+    the drop guard below is only for dates past even Date32."""
+    rows, result = _rows(
+        [
+            _fact(
+                concept="us-gaap:RestructuringAndRelatedCostExpectedCost",
+                period_start=date(1900, 1, 1),
+                period_end=date(2199, 12, 31),
+                filing_date=date(2010, 9, 29),
+            ),
+            _fact(),  # an ordinary fact from the same company
+        ]
+    )
+    assert result.rows_landed == 2  # BOTH land — nothing lost
+    assert result.dropped_out_of_range == 0
+    sentinel = next(r for r in rows if "Restructuring" in r.raw_tag)
+    assert sentinel.period_start == date(1900, 1, 1)
+    assert sentinel.period_end == date(2199, 12, 31)
+
+
+def test_dates_beyond_date32_are_dropped_not_passed_to_the_driver():
+    """Widening to Date32 is not total cover — a filer could stamp 9999-12-31.
+    Anything past the column's range is dropped here, so it can never reach the
+    driver and fail the company's insert."""
+    rows, result = _rows(
+        [
+            _fact(period_start=date(2023, 1, 1), period_end=date(9999, 12, 31)),
+            _fact(period_start=date(1, 1, 1), period_end=date(1850, 1, 1)),
+            _fact(filing_date=date(9999, 1, 1)),
+            _fact(),  # good
+        ]
+    )
+    assert result.dropped_out_of_range == 3
+    assert result.rows_landed == 1
+    assert all(
+        date(1900, 1, 1) <= r.period_start <= date(2299, 12, 31) for r in rows
+    )
+
+
+def test_out_of_range_drops_are_counted_in_the_dropped_total():
+    _, result = _rows([_fact(period_end=date(9999, 12, 31))])
+    assert result.dropped_out_of_range == 1
+    assert result.dropped >= 1  # surfaced in the reported total, never silent
+    assert result.rows_landed == 0
