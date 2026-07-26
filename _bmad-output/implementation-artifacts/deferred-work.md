@@ -4,9 +4,19 @@ Open deferred items only, newest story first. Anything closed moves to
 [Resolved](#resolved) at the bottom with a note on what closed it — this ledger is
 the pre-retro checklist, so the open set has to stay readable at a glance.
 
-**35 open items across 17 stories/reviews.** None blocks v1. Three are worth pulling
-out because their own stated revisit trigger has already fired, so they are live
-rather than hypothetical:
+**36 open items across 17 stories/reviews.** None blocks v1.
+
+> **Read the severity guesses here with suspicion.** Every item carries a priority
+> assigned at defer time, and nothing has ever revisited those judgments. When we
+> finally checked (2026-07-25/26), three items' own stated revisit triggers had
+> already fired unnoticed, and a fourth — the `Date` range guard, filed *low* and
+> "unreachable for real SEC/XBRL data" — turned out to be reachable on the first
+> full-market run, on a mega-cap, costing 26,035 facts. The premise was simply
+> wrong, and nothing in the process would have caught that. Re-examine a premise
+> before trusting a priority.
+
+Three items are worth pulling out because their own stated revisit trigger has
+already fired, so they are live rather than hypothetical:
 
 - **Schema migrations** (medium, code review of story-1.2) — `CREATE … IF NOT EXISTS`
   is create-only, so a changed definition needs a manual drop/recreate. The dropped
@@ -16,6 +26,17 @@ rather than hypothetical:
   deferred until "the lease/heartbeat lands". It landed in Story 3.2.
 - **`next_canonical_version` read-then-increment is not atomic** (low, code review of
   story-1.5) — deferred until "the lease lands". Same trigger, also fired.
+
+## Deferred from: first full-market backfill (2026-07-26)
+
+The first run over the whole S&P 500 (500 companies, 12.59M facts, ~7 min). It
+closed one item (see Resolved) and opened these two.
+
+- **`status` overstates its gap count when the CIK backstop rescues a ticker** (low, cosmetic-but-misleading) — `universe --refresh-sp500` carries a symbol that edgartools cannot resolve offline into `[universe].ciks` using the source's own CIK, so the *company* is in scope. But `resolve_universe` still records the unresolved *ticker* as a `UniverseGap`, so `fintin universe` and `fintin status` both report it as an explained gap while the company is present and screenable. Live instance: ECHO (CIK 1415404) — reported as a gap, actually one of the 498 companies in the store. Harmless to data, but it inflates the gap count and sends operators chasing a non-problem; documented in the README as a stopgap. Fix: suppress a ticker gap when its resolved CIK is already in `ResolvedUniverse.ciks` (or mark it "resolved via explicit CIK" rather than a gap). Small and self-contained.
+- **Universe of ALL public companies is deferred; the quick path is not the recommended one** (design decision, 2026-07-26) — extending beyond the S&P 500 to every XBRL filer (**7,992 unique CIKs** in edgartools' bundled table, ~16x the current scope). Extrapolating from the measured S&P 500 run: **~8,000 `companyfacts` requests, ~2 hours wall clock, ~15-25 GiB** across both tiers (an upper bound — index members are the largest filers with the longest histories). Two paths, deliberately NOT taken yet:
+  - *Quick:* a `--all-tickers` flag on the existing fetch writing every CIK from the bundled table (~15 lines; `backfill` already scales to any Universe size, so no engine work). **Rejected for now** on ban risk: 8,000 sequential EDGAR requests is a materially different NFR-7 exposure than 500, and the architecture explicitly says not to do per-company at full-market scale (AD-13).
+  - *Right:* the deferred bulk `companyfacts.zip` strategy — one download instead of 8,000 requests, dropping in behind the existing `BackfillStrategy` seam. Blocked on the sync-only `EdgarClient.run` (story-1.3 defer), which cannot wrap the bulk/async download.
+  Also unresolved: what "all" means for the Universe *concept* — coverage and `status` are defined against a configured list, so this needs either 7,992 CIKs materialized into config or an explicit "all" semantic. Revisit with the bulk strategy; decide the Universe semantics first.
 
 ## Deferred from: code review of story-3.3 (2026-07-25)
 
@@ -43,10 +64,6 @@ rather than hypothetical:
 
 - **No singleton enforcement on `EdgarClient`** (medium) — every `EdgarClient(...)` mutates process-global edgar state (`EDGAR_IDENTITY`, `EDGAR_RATE_LIMIT_PER_SEC`, `httpclient.HTTP_MGR`); a second construction at a different rate silently replaces the first (last-writer-wins), and a construction landing mid-request could close the prior client's transport. Deferred: v1 is single-process and ingestion is single-flight (AD-12, Epic 3), so concurrent clients aren't a real scenario yet. Revisit when the lease/heartbeat lands or if a second concurrent EDGAR consumer appears — enforce a module-level `configure_edgar()`-once or a singleton. **Trigger fired:** the lease/heartbeat landed in Story 3.2.
 - **`run()` is sync-only** (medium) — it can wrap edgartools' synchronous per-company path (v1, AD-13) but not the async fetchers or the bulk `companyfacts.zip` download, which raise `TooManyRequestsError` on their own coroutine path and would throttle outside the cool-down policy. Deferred: the bulk strategy is explicitly deferred (AD-13) and v1 uses only the sync per-company API. Add an async `run` variant (or a shared cool-down helper both call) when the bulk/async path is built.
-
-## Deferred from: code review of story-1.4 (2026-07-24)
-
-- **ClickHouse `Date` range guard** (low) — `raw_fact.period_start`/`period_end`/`filed_date` are `Date` (1970-01-01 … 2149-06-06). An out-of-range or corrupt date (typo, malformed XBRL) would be clamped/rejected by clickhouse-connect, desyncing it from the pre-insert `content_hash` and corrupting the identity key. Deferred: unreachable for real SEC/XBRL data (EDGAR XBRL is post-~2009, well inside the window). Revisit by widening to `Date32` or range-checking dates in the transform when at-rest integrity validation (the deferred AD-14 scrub) is built.
 
 ## Deferred from: story-1.5 (2026-07-24)
 
@@ -104,6 +121,29 @@ rather than hypothetical:
 - **`fintin status`'s high-water mark is store-wide, not Universe-scoped** (low) — `status` renders `high_water_mark(client)` = `max(filed_date)` over all of `raw_fact`, with no CIK filter. If the store holds facts only for CIKs *outside* the current Universe scope (e.g. after a config edit removed a previously-ingested CIK, or a manual `ingest-company` of a non-Universe CIK), the report can print `Coverage: 0 of N in-scope companies present. High-water mark: <a real date>.` — a concrete currency date alongside zero in-scope presence, which can be misread as "in-scope data exists through that date." Not a bug: FR-14 explicitly specifies "the **store's** High-water mark" (so store-wide is what's asked for), the shared `high_water_mark` primitive is deliberately store-wide (the reconciler's scan-sizing hint, AD-16), and the mismatch only arises under Universe-config churn. Revisit by either scoping the HWM to `resolved.ciks` (a new `max(filed_date) WHERE cik IN (...)` repo query — the story deliberately added none) or annotating the line as "(store-wide)" if a Universe-scoped currency figure is wanted.
 
 ## Resolved
+
+### Closed by the first full-market backfill (2026-07-26)
+- **ClickHouse `Date` range guard** (was: code review of story-1.4) — columns widened
+  to `Date32` (1900–2299) in both tiers, plus a counted `dropped_out_of_range` check
+  in the transform for anything past even that.
+
+  **Worth reading as a process finding, not just a fix.** This was filed *low*
+  severity and deferred on the premise that it was "unreachable for real SEC/XBRL
+  data (EDGAR XBRL is post-~2009, well inside the window)". That premise was
+  false. Oracle (CIK 1341439) stamps `RestructuringAndRelatedCostExpectedCost`
+  with the sentinel range 1900-01-01 → 2199-12-31 for an open-ended expected
+  cost — normal filer practice, not corruption. Because a company commits as one
+  atomic insert, that **single row out of 12.59 million** lost all 26,035 of
+  Oracle's facts.
+
+  Three things made it hard to see, all worth carrying into the retro:
+  1. It surfaced as an ordinary explained gap ("no facts in store") — indistinguishable
+     from a company that legitimately has no XBRL yet. AD-1's no-failures-ledger
+     decision working as designed, and also the reason this hid.
+  2. Only a **full-market** run could find it. Every prior test used one or two
+     companies.
+  3. The `--debug` flag added the same day is what surfaced the cause; the default
+     one-liner said only "Ingest failed".
 
 ### Closed by the deferred-work cleanup pass (2026-07-25)
 - **No `--debug`/traceback escape hatch on the generic error path** (was: code review of
