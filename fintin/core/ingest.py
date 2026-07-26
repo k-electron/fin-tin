@@ -91,6 +91,7 @@ class IngestResult(NamedTuple):
     dropped_incomplete: int
     deduped: int
     version: int
+    dropped_out_of_range: int = 0
 
     @property
     def dropped(self) -> int:
@@ -99,8 +100,22 @@ class IngestResult(NamedTuple):
             + self.dropped_non_standard
             + self.dropped_non_numeric
             + self.dropped_incomplete
+            + self.dropped_out_of_range
             + self.deduped
         )
+
+
+# ClickHouse `Date32` bounds — the widest date the store can hold.
+#
+# This guard is not theoretical: Oracle (CIK 1341439) files
+# `RestructuringAndRelatedCostExpectedCost` with the sentinel range
+# 1900-01-01 → 2199-12-31 for an open-ended expected cost. A company commits as
+# ONE atomic insert, so a single unstorable date fails the whole company — that
+# one row cost all 26,035 of Oracle's facts on the first full-market backfill.
+# Dropping the offending fact here (counted, never silent) keeps the blast radius
+# at one fact instead of one company.
+_DATE_MIN = date(1900, 1, 1)
+_DATE_MAX = date(2299, 12, 31)
 
 
 def normalize_accession(accn: str) -> str:
@@ -163,6 +178,7 @@ def to_raw_fact_rows(
     (de-duplicated by identity key, last-wins) and an :class:`IngestResult`."""
     by_key: dict[tuple, RawFactRow] = {}
     seen = dropped_dim = dropped_std = dropped_num = dropped_incomplete = deduped = 0
+    dropped_out_of_range = 0
 
     for f in facts:
         seen += 1
@@ -193,6 +209,16 @@ def to_raw_fact_rows(
                 dropped_incomplete += 1
                 continue
             period_start = f.period_start
+
+        # Every date must fit the store's Date32 columns. Checked BEFORE the row is
+        # built so an unstorable date can never reach the driver and take the
+        # company's whole atomic insert down with it (see _DATE_MIN/_DATE_MAX).
+        if not all(
+            _DATE_MIN <= d <= _DATE_MAX
+            for d in (period_start, period_end, f.filing_date)
+        ):
+            dropped_out_of_range += 1
+            continue
 
         raw_tag = f.concept  # full qualified element (namespace kept — key safety)
         value = float(f.numeric_value)
@@ -242,6 +268,7 @@ def to_raw_fact_rows(
         dropped_non_standard=dropped_std,
         dropped_non_numeric=dropped_num,
         dropped_incomplete=dropped_incomplete,
+        dropped_out_of_range=dropped_out_of_range,
         deduped=deduped,
         version=int(version),
     )

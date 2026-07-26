@@ -264,3 +264,65 @@ def test_present_ciks_empty_short_circuits_without_a_query():
             raise AssertionError("present_ciks must not query for empty ciks")
 
     assert present_ciks(_NoQuery(), ciks=[]) == set()
+
+
+# --- Date32: the live Oracle failure, proven at the driver/insert layer ----------
+
+
+@pytest.mark.integration
+def test_sentinel_dates_insert_and_round_trip(schema_client):
+    """The regression that matters. Oracle (CIK 1341439) stamps
+    `RestructuringAndRelatedCostExpectedCost` 1900-01-01 -> 2199-12-31, outside
+    ClickHouse `Date`'s 1970..2149 window. clickhouse-connect raised
+    `DataError: Unable to create native array for column period_start`, and since a
+    company commits as ONE atomic insert, that single row lost all 26,035 of
+    Oracle's facts on the first full-market backfill.
+
+    The unit test proves the transform keeps the row; only this proves the STORE
+    accepts it, which is where it actually broke.
+    """
+    row = RawFactRow(
+        cik=1341439,
+        accession="0001341439-10-000015",
+        raw_tag="us-gaap:RestructuringAndRelatedCostExpectedCost",
+        raw_label="Expected restructuring cost",
+        taxonomy="us-gaap",
+        period_start=date(1900, 1, 1),
+        period_end=date(2199, 12, 31),
+        unit="USD",
+        value=1.0,
+        form="10-K",
+        filed_date=date(2010, 9, 29),
+        content_hash="sentinel",
+        taxonomy_version="5.43.0",
+        version=1,
+    )
+    ordinary = _row(content_hash="ordinary")
+
+    # One atomic insert containing both — exactly the shape that failed.
+    landed = insert_raw_facts(schema_client, [row, ordinary])
+    assert landed == 2
+
+    got = schema_client.query(
+        "SELECT period_start, period_end, filed_date FROM raw_fact "
+        "WHERE cik = 1341439"
+    ).result_rows
+    assert got == [(date(1900, 1, 1), date(2199, 12, 31), date(2010, 9, 29))]
+
+
+@pytest.mark.integration
+def test_date_columns_are_date32(schema_client):
+    """Guards the widening itself: if these revert to `Date`, the Oracle class of
+    filing silently starts failing whole companies again."""
+    types = dict(
+        schema_client.query(
+            "SELECT name, type FROM system.columns "
+            "WHERE table = 'raw_fact' AND name IN "
+            "('period_start','period_end','filed_date')"
+        ).result_rows
+    )
+    assert types == {
+        "period_start": "Date32",
+        "period_end": "Date32",
+        "filed_date": "Date32",
+    }

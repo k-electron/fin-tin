@@ -32,6 +32,12 @@ Key invariants:
   by this and has been DROPPED: nothing read it, yet it fired on every Tier 1
   insert and stood as a second materialized copy to keep consistent (AD-1).
 - AD-17: instant facts period_start = period_end; duration period_start < period_end.
+- Dates are `Date32` (1900-01-01 … 2299-12-31), not `Date` (1970 … 2149). Real
+  filings use sentinel dates outside the narrower window — Oracle stamps an
+  open-ended restructuring cost 1900-01-01 → 2199-12-31 — and because a company
+  commits as one atomic insert, a single unstorable date failed that company
+  entirely. `core.ingest` also drops (and counts) anything outside even these
+  bounds, so the widening and the guard together cap the blast radius at one fact.
 """
 
 from __future__ import annotations
@@ -49,12 +55,12 @@ CREATE TABLE IF NOT EXISTS raw_fact (
     raw_tag          String,
     raw_label        String,
     taxonomy         LowCardinality(String),
-    period_start     Date,
-    period_end       Date,
+    period_start     Date32,
+    period_end       Date32,
     unit             String,
     value            Float64,
     form             LowCardinality(String),
-    filed_date       Date,
+    filed_date       Date32,
     content_hash     String,
     taxonomy_version String,
     version          UInt64
@@ -70,12 +76,12 @@ CREATE TABLE IF NOT EXISTS canonical_fact (
     raw_tag           String,
     canonical_concept String,
     raw_label         String,
-    period_start      Date,
-    period_end        Date,
+    period_start      Date32,
+    period_end        Date32,
     unit              String,
     value             Float64,
     form              LowCardinality(String),
-    filed_date        Date,
+    filed_date        Date32,
     content_hash      String,
     taxonomy_version  String,
     version           UInt64
